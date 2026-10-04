@@ -377,6 +377,41 @@ public sealed class ConversationWorkflowTests(ApiFactory factory)
     }
 
     [Fact]
+    public async Task A_workflow_change_that_loses_a_concurrency_race_is_a_conflict_not_a_crash()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Nabil Fahmy", "Hello");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+
+        // Two mutations the owner is allowed to make, fired together: whoever loses has to be told
+        // to reload, not shown a 500. Every conversation-mutating operation is guarded by RowVersion,
+        // not only take.
+        var raced = await Task.WhenAll(
+            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/release"),
+            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve"));
+
+        var statuses = raced.Select(x => x.StatusCode).ToList();
+
+        statuses.Should().Contain(HttpStatusCode.OK);
+        statuses.Should().NotContain(HttpStatusCode.InternalServerError);
+
+        var loser = raced.First(x => x.StatusCode != HttpStatusCode.OK);
+        loser.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        (await ApiClient.ReadProblemAsync(loser)).ErrorCode.Should().Be(ConversationErrors.Changed);
+
+        // Two resolves in a row: the second one is a conflict too, whichever check catches it first.
+        var resolved = await Task.WhenAll(
+            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve"),
+            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve"));
+
+        resolved.Select(x => x.StatusCode).Should().AllSatisfy(
+            x => x.Should().BeOneOf(HttpStatusCode.OK, HttpStatusCode.Conflict));
+    }
+
+    [Fact]
     public async Task Reading_a_conversation_requires_a_token()
     {
         var anonymous = ApiClient.Anonymous(factory);

@@ -236,7 +236,10 @@ public sealed class ConversationsService(
         conversation.Release();
         db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Released, agentId, null));
 
-        await db.SaveChangesAsync(cancellationToken);
+        if (!await TrySaveAsync(conversationId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(Changed());
+        }
 
         logger.LogInformation("Conversation {ConversationId} released by agent {AgentId}.", conversationId, agentId);
 
@@ -294,7 +297,10 @@ public sealed class ConversationsService(
         conversation.Assign(targetAgentId);
         db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Transferred, agentId, targetAgentId));
 
-        await db.SaveChangesAsync(cancellationToken);
+        if (!await TrySaveAsync(conversationId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(Changed());
+        }
 
         logger.LogInformation(
             "Conversation {ConversationId} transferred from {ActorId} to {TargetId}.",
@@ -325,7 +331,10 @@ public sealed class ConversationsService(
         conversation.Resolve();
         db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Resolved, agentId, null));
 
-        await db.SaveChangesAsync(cancellationToken);
+        if (!await TrySaveAsync(conversationId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(Changed());
+        }
 
         logger.LogInformation("Conversation {ConversationId} resolved by agent {AgentId}.", conversationId, agentId);
 
@@ -360,7 +369,10 @@ public sealed class ConversationsService(
 
         db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Reopened, agentId, null));
 
-        await db.SaveChangesAsync(cancellationToken);
+        if (!await TrySaveAsync(conversationId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(Changed());
+        }
 
         logger.LogInformation("Conversation {ConversationId} reopened by agent {AgentId}.", conversationId, agentId);
 
@@ -462,7 +474,7 @@ public sealed class ConversationsService(
 
         db.Messages.Add(message);
 
-        try
+try
         {
             // Stored before the provider call: a crash mid-send must not lose the agent's reply.
             await db.SaveChangesAsync(cancellationToken);
@@ -490,6 +502,8 @@ public sealed class ConversationsService(
             logger.LogWarning("Outbound message {MessageId} failed: {Reason}", message.Id, result.FailureReason);
         }
 
+// The delivery status is bookkeeping on top of an already-stored message: if this one loses
+        // a race the message is still there, so it is logged rather than turned into an error.
         await db.SaveChangesAsync(cancellationToken);
 
         var senderName = await db.Agents
@@ -501,7 +515,7 @@ public sealed class ConversationsService(
         return Result.Success(ToMessageResponse(message, senderName));
     }
 
-    private async Task<bool> TrySaveAsync(Guid conversationId, CancellationToken cancellationToken)
+private async Task<bool> TrySaveAsync(Guid conversationId, CancellationToken cancellationToken)
     {
         try
         {
