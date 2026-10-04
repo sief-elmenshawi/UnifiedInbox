@@ -1,0 +1,10 @@
+* text=auto
+
+*.cs text diff=csharp
+*.csproj text
+*.sln text eol=crlf
+*.json text
+*.md text
+*.http text
+.gitattributes text
+.gitignore text
