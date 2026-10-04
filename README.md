@@ -77,6 +77,10 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `GET` | `/api/conversations/{id}/messages?pageSize=50&before={messageId}` | Newest first. |
 | `POST` | `/api/conversations/{id}/take\|release\|transfer\|resolve\|reopen\|read` | `transfer` body: `{"targetAgentId":"…"}`. |
 | `POST` | `/api/conversations/{id}/messages` | Body `{"text":"…"}`; only inside the 24-hour reply window. |
+| `GET` | `/api/channels` | Admin only. Secrets are never returned, only whether they are set. |
+| `POST` | `/api/channels` | Admin only. Body `{"type":"WhatsApp","displayName":"…","externalAccountId":"…","accessToken":"…"}`. |
+| `PUT` | `/api/channels/{id}` | Admin only. Omit a secret to keep the stored one. |
+| `DELETE` | `/api/channels/{id}` | Admin only. Disconnects the channel; nothing is deleted and history stays readable. |
 | `POST` | `/api/dev/simulate-inbound` | Development only, admin only. |
 
 ## Tests
@@ -110,4 +114,5 @@ tests/                    Domain.Tests, Application.Tests, IntegrationTests (Web
 | `401` with `auth.account_locked` | 5 wrong passwords in a row locks the account for 15 minutes. An admin can reset the password. |
 | `404` on `/api/dev/simulate-inbound` | The dev endpoints are only mapped in Development; outside it the route does not exist. |
 | `409` with `conversation.already_taken` | Another agent owns the conversation. Use `transfer` (owner or admin) instead of stealing it. |
-| `422` with `conversation.window_closed` | The last inbound message is older than 24 hours; templates are a later phase. |
+| `422` with `conversation.window_closed` | The last inbound message is older than 24 hours; templates are a later phase. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
+| `403` on `/api/channels` | Agents cannot manage channels; only an admin can connect or disconnect one. |

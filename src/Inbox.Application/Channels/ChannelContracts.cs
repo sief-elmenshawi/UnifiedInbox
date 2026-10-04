@@ -1,3 +1,4 @@
+using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
 
@@ -50,4 +51,58 @@ public interface IChannelAdapterFactory
     IChannelAdapter Get(ChannelType type);
 
     bool Supports(ChannelType type);
+}
+
+/// <summary>
+/// Connecting a channel. The access token, app secret and webhook verify token are write-only:
+/// they go in, they are stored as Data Protection ciphertext, and they never come back out.
+/// </summary>
+public sealed record CreateChannelRequest(
+    string Type,
+    string DisplayName,
+    string ExternalAccountId,
+    string? AccessToken,
+    string? AppSecret,
+    string? WebhookVerifyToken);
+
+/// <summary>
+/// Every secret is optional here and "leave it alone" is expressed by omitting it: an admin
+/// fixing a display name must not have to re-enter a token to do it.
+/// </summary>
+public sealed record UpdateChannelRequest(
+    string DisplayName,
+    string? ExternalAccountId,
+    string? AccessToken,
+    string? AppSecret,
+    string? WebhookVerifyToken);
+
+public sealed record ChannelResponse(
+    Guid Id,
+    string Type,
+    string DisplayName,
+    string ExternalAccountId,
+    bool IsActive,
+    bool HasAccessToken,
+    bool HasAppSecret,
+    bool HasWebhookVerifyToken,
+    DateTime CreatedAtUtc);
+
+public interface IChannelsService
+{
+    Task<Result<IReadOnlyList<ChannelResponse>>> ListAsync(CancellationToken cancellationToken = default);
+
+    Task<Result<ChannelResponse>> GetByIdAsync(Guid channelId, CancellationToken cancellationToken = default);
+
+    Task<Result<ChannelResponse>> CreateAsync(CreateChannelRequest request, CancellationToken cancellationToken = default);
+
+    Task<Result<ChannelResponse>> UpdateAsync(
+        Guid channelId,
+        UpdateChannelRequest request,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Deactivates the channel. Nothing is deleted: existing conversations must keep pointing at a
+    /// real channel, and a deactivated channel stops inbound processing and outbound replies.
+    /// </summary>
+    Task<Result> DeactivateAsync(Guid channelId, CancellationToken cancellationToken = default);
 }

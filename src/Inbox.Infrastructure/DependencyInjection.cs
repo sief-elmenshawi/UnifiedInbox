@@ -13,6 +13,7 @@ using Inbox.Infrastructure.Persistence;
 using Inbox.Infrastructure.Seeding;
 using Inbox.Infrastructure.Tenancy;
 using Inbox.Domain.Entities;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -87,6 +88,7 @@ public static class DependencyInjection
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IAgentsService, AgentsService>();
         services.AddScoped<IConversationsService, ConversationsService>();
+        services.AddScoped<IChannelsService, ChannelsService>();
         services.AddScoped<IInboundProcessor, InboundProcessor>();
         services.AddScoped<IWorkspaceContext, SingleWorkspaceContext>();
         services.AddScoped<IDatabaseSeeder, DatabaseSeeder>();
@@ -95,6 +97,13 @@ public static class DependencyInjection
         // a new adapter class and nothing else.
         services.AddSingleton<IChannelAdapter, TestChannelAdapter>();
         services.AddSingleton<IChannelAdapterFactory, ChannelAdapterFactory>();
+
+        // Channel credentials are encrypted at rest. The key ring lives outside the database
+        // (user profile or the host's key store), so a database dump alone yields nothing usable.
+        services.AddDataProtection();
+        services.AddSingleton<IDataProtector>(sp => sp
+            .GetRequiredService<IDataProtectionProvider>()
+            .CreateProtector(ChannelsService.ProtectorPurpose));
 
         // The queue is a singleton so the webhook endpoint and the worker share it; the processor
         // behind it is scoped, because it needs a DbContext per message.
