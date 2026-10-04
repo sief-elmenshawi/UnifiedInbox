@@ -1,0 +1,137 @@
+using Inbox.Application.Common;
+using Inbox.Domain.Common;
+
+namespace Inbox.Application.Conversations;
+
+public enum ConversationFilter
+{
+    /// <summary>Everything that is not resolved.</summary>
+    All = 0,
+    Unassigned = 1,
+    Mine = 2,
+    Resolved = 3
+}
+
+public sealed record ConversationContactSummary(Guid Id, string DisplayName, string ExternalId, string? AvatarUrl);
+
+public sealed record ConversationChannelSummary(Guid Id, string Type, string DisplayName);
+
+public sealed record ConversationListItemResponse(
+    Guid Id,
+    Guid ContactId,
+    string ContactDisplayName,
+    Guid ChannelId,
+    string ChannelType,
+    Guid? AssignedAgentId,
+    string? AssignedAgentName,
+    string Status,
+    int UnreadCount,
+    string? LastMessagePreview,
+    DateTime LastMessageAtUtc,
+    DateTime? LastInboundAtUtc,
+    bool ReplyWindowOpen);
+
+public sealed record ConversationDetailResponse(
+    Guid Id,
+    ConversationContactSummary Contact,
+    ConversationChannelSummary Channel,
+    Guid? AssignedAgentId,
+    string? AssignedAgentName,
+    string Status,
+    int UnreadCount,
+    string? LastMessagePreview,
+    DateTime LastMessageAtUtc,
+    DateTime? LastInboundAtUtc,
+    DateTime? WindowExpiresAtUtc,
+    bool ReplyWindowOpen,
+    DateTime CreatedAtUtc,
+    IReadOnlyList<ConversationEventResponse> Events);
+
+public sealed record ConversationEventResponse(
+    Guid Id,
+    string Type,
+    Guid? ActorAgentId,
+    string? ActorAgentName,
+    Guid? TargetAgentId,
+    string? TargetAgentName,
+    DateTime CreatedAtUtc);
+
+public sealed record ConversationMessageResponse(
+    Guid Id,
+    string Direction,
+    string SenderType,
+    Guid? SenderAgentId,
+    string? SenderAgentName,
+    string Type,
+    string? Text,
+    string? ExternalMessageId,
+    string DeliveryStatus,
+    string? FailureReason,
+    DateTime CreatedAtUtc);
+
+public sealed record SendMessageRequest(string Text);
+
+public sealed record TransferConversationRequest(Guid TargetAgentId);
+
+public interface IConversationsService
+{
+    Task<Result<PagedResult<ConversationListItemResponse>>> ListAsync(
+        Guid agentId,
+        ConversationFilter filter,
+        Guid? channelId = null,
+        string? search = null,
+        int pageSize = 25,
+        string? cursor = null,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> GetAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Newest first, with a <c>before</c> cursor pointing at a known message id.</summary>
+    Task<Result<PagedResult<ConversationMessageResponse>>> GetMessagesAsync(
+        Guid agentId,
+        Guid conversationId,
+        int pageSize = 50,
+        Guid? before = null,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> TakeAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> ReleaseAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> TransferAsync(
+        Guid agentId,
+        Guid conversationId,
+        Guid targetAgentId,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> ResolveAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    Task<Result<ConversationDetailResponse>> ReopenAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    Task<Result> MarkReadAsync(
+        Guid agentId,
+        Guid conversationId,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Sends through the channel adapter and stores the result, including failures.</summary>
+    Task<Result<ConversationMessageResponse>> SendMessageAsync(
+        Guid agentId,
+        Guid conversationId,
+        string text,
+        CancellationToken cancellationToken = default);
+}

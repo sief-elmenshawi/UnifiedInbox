@@ -16,6 +16,16 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      The Identity service registration helpers (AddIdentity<TUser, TRole>, AddEntityFrameworkStores)
+      and ASP.NET Core Data Protection live in the shared framework, not in NuGet packages. Referencing
+      the framework here keeps UserManager/RoleManager bound to IdentityRole<Guid> - the same key type
+      the DbContext uses - without hand-registering a dozen store interfaces.
+    -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Inbox.Application\Inbox.Application.csproj" />
   </ItemGroup>
 

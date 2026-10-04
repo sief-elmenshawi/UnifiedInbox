@@ -100,6 +100,21 @@ public class Conversation
         UnreadCount = 0;
     }
 
+    public bool IsAssignedTo(Guid? agentId) => AssignedAgentId == agentId;
+
+    /// <summary>Take or transfer. The conversation keeps its assignee until it is released.</summary>
+    public void Assign(Guid agentId) => AssignedAgentId = agentId;
+
+    public void Release() => AssignedAgentId = null;
+
+    /// <summary>
+    /// Resolving keeps the assignee so reopening can hand the thread back to whoever was working on
+    /// it. The agent list filters on open conversations, so a resolved thread never shows up as work.
+    /// </summary>
+    public void Resolve() => Status = ConversationStatus.Resolved;
+
+    public void Reopen() => Status = ConversationStatus.Open;
+
     private void Touch(string? text, DateTime nowUtc)
     {
         LastMessageAtUtc = nowUtc;

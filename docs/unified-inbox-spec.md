@@ -469,6 +469,17 @@ Track viewers in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by
 - Outbound send via a fake adapter.
 - **Done when**: full flow works through the simulator and integration tests cover take-race and idempotency.
 
+**Status: done.** Decisions taken while building it:
+
+- The simulator is mapped at `/api/dev/simulate-inbound` (the `/api` prefix matches every other endpoint), is removed from MVC outside Development by `DevOnlyControllerFeatureProvider`, and requires an admin token.
+- It answers `202 Accepted` once queued; `InboundProcessorWorker` stores the message. The queue is an in-memory bounded `Channel` with `DropOldest`, so a burst can never block the caller.
+- Idempotency is enforced by the unique index on `(ChannelId, ExternalMessageId)`, with a pre-check and one retry; the pre-check alone would not survive two workers racing.
+- Taking a conversation you already own returns `200` (the UI fires it from two places); taking one owned by anyone else returns `409 conversation.already_taken` — **including for admins**, who use `transfer` so the event history never pretends nobody was working on it.
+- `resolve` keeps the assignee so `reopen` hands the thread back; reopening releases it if the owner has been deactivated.
+- A new inbound message on a resolved conversation reopens that thread rather than opening a second one.
+- Outbound replies are stored before the adapter is called and only allowed inside the 24-hour window; `TestChannelAdapter` fails on demand when the text starts with `/fail`.
+- `WebApplicationFactory` never calls `IHost.StartAsync`, so `ApiFactory` starts the hosted services itself — otherwise the queue worker never runs and the async path cannot be tested.
+
 ### Phase 3 — SignalR
 
 - Hub, groups, all events from section 8, viewing/typing, presence.
@@ -503,6 +514,11 @@ Track viewers in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by
 - **Integration tests** (WebApplicationFactory + Testcontainers SQL Server): auth flow, take race condition, webhook idempotency (same payload twice → one message), signature rejection, outbound window enforcement.
 - **Adapter tests**: feed recorded sample Meta payloads (stored under `tests/Fixtures/`) and assert normalized `InboundEvent`s.
 
+`dotnet test` runs everything. The integration tests start a throwaway SQL Server container through
+Testcontainers, so they need a running Docker daemon and pull `mcr.microsoft.com/mssql/server:2022-latest`
+on first run. One container is shared by the whole suite, so the tests run serially: Identity's lockout
+counters are per account, and parallel logins against the same account would trip them.
+
 ## 12. Configuration (appsettings / env)
 
 ```json
@@ -512,9 +528,21 @@ Track viewers in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by
   "Seed": { "WorkspaceName": "", "AdminEmail": "", "AdminDisplayName": "", "AdminPassword": "" },
   "Meta": { "GraphApiVersion": "<set from current Meta docs>", "GraphBaseUrl": "https://graph.facebook.com" },
   "Cors": { "AllowedOrigins": [ "http://localhost:4200" ] },
-  "Storage": { "RootPath": "" }
+  "Storage": { "RootPath": "" },
+  "RateLimiting": {
+    "LoginPermitLimit": 30,
+    "LoginWindowSeconds": 60,
+    "RefreshPermitLimit": 60,
+    "RefreshWindowSeconds": 60,
+    "WebhookPermitLimit": 600,
+    "WebhookWindowSeconds": 60
+  }
 }
 ```
+
+The rate limits are per IP because the limiter runs before the request body is read, so the account is
+not known yet. When the whole office shares one public IP, raise `LoginPermitLimit`; brute-force
+protection is the Identity lockout (5 failures, then 15 minutes), not the per-IP counter.
 
 No real secrets committed. Provide `appsettings.Development.json.example`.
 

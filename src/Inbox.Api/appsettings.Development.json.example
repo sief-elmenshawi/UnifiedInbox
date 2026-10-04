@@ -1,0 +1,57 @@
+{
+  "_comment": "Copy to appsettings.Development.json (git-ignored) and edit. Loaded only when ASPNETCORE_ENVIRONMENT=Development, which 'dotnet run' and F5 set for you. Keep real secrets in user-secrets instead: dotnet user-secrets --project src/Inbox.Api set \"Jwt:SigningKey\" \"<value>\"",
+  "Serilog": {
+    "MinimumLevel": {
+      "Default": "Debug",
+      "Override": {
+        "Microsoft": "Information",
+        "Microsoft.EntityFrameworkCore.Database.Command": "Information"
+      }
+    },
+    "WriteTo": [
+      {
+        "Name": "Console",
+        "Args": {
+          "outputTemplate": "[{Timestamp:HH:mm:ss} {Level:u3}] {CorrelationId} {SourceContext}{NewLine}    {Message:lj}{NewLine}{Exception}"
+        }
+      },
+      {
+        "Name": "File",
+        "Args": {
+          "path": "logs/inbox-.log",
+          "rollingInterval": "Day",
+          "retainedFileCountLimit": 7
+        }
+      }
+    ]
+  },
+  "ConnectionStrings": {
+    "Default": "Server=(localdb)\\mssqllocaldb;Database=UnifiedInbox;Trusted_Connection=True;MultipleActiveResultSets=true;TrustServerCertificate=True"
+  },
+  "Jwt": {
+    "Issuer": "unified-inbox",
+    "Audience": "unified-inbox-api",
+    "SigningKey": "CHANGE_ME_dev_only_signing_key_at_least_32_chars_long_0123456789",
+    "AccessTokenMinutes": 15,
+    "RefreshTokenDays": 14
+  },
+  "Seed": {
+    "WorkspaceName": "Default",
+    "AdminEmail": "admin@local.test",
+    "AdminDisplayName": "Local Admin",
+    "AdminPassword": "CHANGE_ME_Local_Admin_Password1!"
+  },
+  "Cors": {
+    "AllowedOrigins": [ "http://localhost:4200" ]
+  },
+  "RateLimiting": {
+    "LoginPermitLimit": 30,
+    "LoginWindowSeconds": 60
+  },
+  "Storage": {
+    "RootPath": "storage"
+  },
+  "Swagger": {
+    "Enabled": true
+  }
+}
