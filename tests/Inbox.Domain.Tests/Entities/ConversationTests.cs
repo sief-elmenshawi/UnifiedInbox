@@ -71,6 +71,52 @@ public class ConversationTests
     }
 
     [Fact]
+    public void RecordInbound_StartsTheWindowFromTheCustomerTimestamp_NotFromArrival()
+    {
+        var conversation = NewConversation();
+        var sentAt = Now.AddHours(-25);
+
+        // The webhook arrives now, but the customer wrote a day and a half ago.
+        conversation.RecordInbound("hello", Now, sentAt);
+
+        conversation.LastInboundAtUtc.Should().Be(sentAt);
+        conversation.WindowExpiresAtUtc.Should().Be(sentAt.AddHours(24));
+        conversation.IsReplyWindowOpen(Now).Should().BeFalse();
+
+        // The list still sorts by arrival, so a fresh message floats to the top even when the
+        // customer's clock says otherwise.
+        conversation.LastMessageAtUtc.Should().Be(Now);
+    }
+
+    [Fact]
+    public void RecordInbound_IgnoresATimestampInTheFuture()
+    {
+        var conversation = NewConversation();
+
+        conversation.RecordInbound("hello", Now, Now.AddHours(5));
+
+        // A provider or device with the wrong clock must not invent extra reply window.
+        conversation.LastInboundAtUtc.Should().Be(Now);
+        conversation.WindowExpiresAtUtc.Should().Be(Now.AddHours(24));
+    }
+
+    [Fact]
+    public void RecordInbound_KeepsTheWindowWhenMessagesArriveOutOfOrder()
+    {
+        var conversation = NewConversation();
+
+        conversation.RecordInbound("first", Now, Now.AddHours(-25));
+        conversation.RecordInbound("older, delivered late", Now, Now.AddHours(-26));
+
+        // The late message is the older one, so it must not pull LastInboundAtUtc backwards and
+        // silently re-open a window the customer already lost.
+        conversation.LastInboundAtUtc.Should().Be(Now.AddHours(-25));
+        conversation.WindowExpiresAtUtc.Should().Be(Now.AddHours(-1));
+        conversation.IsReplyWindowOpen(Now).Should().BeFalse();
+        conversation.UnreadCount.Should().Be(2);
+    }
+
+    [Fact]
     public void RecordOutbound_DoesNotExtendTheReplyWindow()
     {
         var conversation = NewConversation();

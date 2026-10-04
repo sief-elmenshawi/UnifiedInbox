@@ -82,10 +82,23 @@ public class Conversation
     public bool IsReplyWindowOpen(DateTime utcNow) =>
         WindowExpiresAtUtc.HasValue && utcNow < WindowExpiresAtUtc.Value;
 
-    public void RecordInbound(string? text, DateTime nowUtc)
+    /// <param name="nowUtc">Arrival time. Drives the list ordering, preview and unread counter.</param>
+    /// <param name="occurredAtUtc">
+    /// When the customer actually sent it, as reported by the channel. The reply window follows
+    /// this, not the arrival time: a webhook that arrives late must not hand us 24 more hours.
+    /// Null (or a timestamp in the future) falls back to <paramref name="nowUtc"/>.
+    /// </param>
+    public void RecordInbound(string? text, DateTime nowUtc, DateTime? occurredAtUtc = null)
     {
-        LastInboundAtUtc = nowUtc;
-        WindowExpiresAtUtc = nowUtc + ReplyWindow;
+        var inboundAt = occurredAtUtc is null || occurredAtUtc > nowUtc ? nowUtc : occurredAtUtc.Value;
+
+        // Messages can arrive out of order (a retry, a delayed delivery), and the window may only
+        // ever move forward: an older message must not shorten a window that is still open.
+        LastInboundAtUtc = LastInboundAtUtc.HasValue && LastInboundAtUtc.Value > inboundAt
+            ? LastInboundAtUtc
+            : inboundAt;
+
+        WindowExpiresAtUtc = LastInboundAtUtc + ReplyWindow;
         Touch(text, nowUtc);
         UnreadCount++;
     }

@@ -19,6 +19,12 @@ internal static class ConversationScenarios
     public static string NewExternalContactId() => $"wa-{Guid.NewGuid():N}";
 
     /// <summary>
+    /// The tests find their conversation again by display name, so a hardcoded name shared with
+    /// another test would make them read each other's thread. The suffix keeps them independent.
+    /// </summary>
+    public static string UniqueName(string prefix) => $"{prefix} {Guid.NewGuid():N}";
+
+    /// <summary>
     /// Posts one inbound message and returns the conversation it landed in. Waits until the stored
     /// message exists, which is the point the processor has finished with the conversation.
     /// </summary>

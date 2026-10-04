@@ -32,25 +32,26 @@ public sealed class InboundMessageTests(ApiFactory factory)
         conversation.Events.Should().ContainSingle(x => x.Type == "Created").Which.ActorAgentId.Should().BeNull();
     }
 
-    [Fact]
+[Fact]
     public async Task The_same_message_delivered_twice_is_stored_once()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var name = ConversationScenarios.UniqueName("Omar Sami");
         var contactId = ConversationScenarios.NewExternalContactId();
         var messageId = $"sim-{Guid.NewGuid():N}";
 
         // Meta retries webhooks, so the same external id arriving twice must be a no-op: one
         // contact, one conversation, one message.
-        await ConversationScenarios.DeliverAsync(admin.Client, "Omar Sami", "First message", messageId, contactId);
-        await ConversationScenarios.DeliverAsync(admin.Client, "Omar Sami", "First message", messageId, contactId);
+        var (_, first) = await ConversationScenarios.DeliverAsync(admin.Client, name, "First message", messageId, contactId);
+        var (_, second) = await ConversationScenarios.DeliverAsync(admin.Client, name, "First message", messageId, contactId);
 
-var page = await ConversationScenarios.ListAsync(admin.Client, "filter=all&search=Omar Sami");
+        second.Id.Should().Be(first.Id);
 
-        page.Items.Should().ContainSingle();
-
-        var messages = await ConversationScenarios.MessagesAsync(admin.Client, page.Items[0].Id);
+        var messages = await ConversationScenarios.MessagesAsync(admin.Client, second.Id);
 
         messages.Items.Should().ContainSingle(x => x.ExternalMessageId == messageId);
+        messages.Items.Should().ContainSingle();
+        second.UnreadCount.Should().Be(1);
     }
 
     [Fact]

@@ -122,6 +122,12 @@ public sealed class InboundProcessor(
     private async Task<Result<InboundProcessResult>> StoreAsync(InboundEvent message, CancellationToken cancellationToken)
     {
         var nowUtc = clock.GetUtcNow().UtcDateTime;
+
+        // The channel's timestamp decides when the 24-hour reply window starts; the arrival time
+        // only decides what the agent list is sorted by. A clock-skewed or missing provider
+        // timestamp falls back to arrival time instead of corrupting the window.
+        var occurredAtUtc = NormalizeOccurredAt(message.OccurredAtUtc, nowUtc);
+
         var contact = await ResolveContactAsync(message, nowUtc, cancellationToken);
         var (conversation, created) = await ResolveConversationAsync(contact, message.ChannelId, nowUtc, cancellationToken);
 
@@ -131,13 +137,12 @@ public sealed class InboundProcessor(
             message.Text,
             message.ExternalMessageId,
             message.Type,
-            message.OccurredAtUtc);
+            occurredAtUtc);
 
         db.Messages.Add(entity);
 
-        // Counters and the reply window follow arrival time, which is what the agent list is sorted
-        // by; the message itself keeps the provider timestamp so the thread reads in order.
-        conversation.RecordInbound(message.Text, nowUtc);
+        // Counters and preview follow arrival time, the window follows the customer's timestamp.
+        conversation.RecordInbound(message.Text, nowUtc, occurredAtUtc);
 
         await db.SaveChangesAsync(cancellationToken);
 
@@ -153,6 +158,23 @@ public sealed class InboundProcessor(
             entity.Id,
             created,
             Duplicate: false));
+    }
+
+    /// <summary>
+    /// Turns the channel's timestamp into a trustworthy UTC instant: local or unspecified kinds are
+    /// read as UTC (webhook payloads carry epoch seconds), and anything in the future - a device
+    /// with the wrong clock, a provider bug - is clamped to now so it cannot invent reply window.
+    /// </summary>
+    private static DateTime NormalizeOccurredAt(DateTime occurredAtUtc, DateTime nowUtc)
+    {
+        var utc = occurredAtUtc.Kind switch
+        {
+            DateTimeKind.Utc => occurredAtUtc,
+            DateTimeKind.Local => occurredAtUtc.ToUniversalTime(),
+            _ => DateTime.SpecifyKind(occurredAtUtc, DateTimeKind.Utc)
+        };
+
+        return utc > nowUtc ? nowUtc : utc;
     }
 
     private async Task<Contact> ResolveContactAsync(InboundEvent message, DateTime nowUtc, CancellationToken cancellationToken)
