@@ -1,7 +1,9 @@
+using Inbox.Infrastructure.Channels.WhatsApp;
 using Inbox.Infrastructure.Persistence;
 using Inbox.Infrastructure.Seeding;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -39,7 +41,9 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         "Cors__AllowedOrigins__0",
         "RateLimiting__LoginPermitLimit",
         "RateLimiting__RefreshPermitLimit",
-        "RateLimiting__WebhookPermitLimit",
+"RateLimiting__WebhookPermitLimit",
+        "Meta__GraphApiVersion",
+        "Meta__GraphBaseUrl",
         "Serilog__MinimumLevel__Default",
         "Serilog__WriteTo__1__Name",
         "Serilog__WriteTo__1__Args__path"
@@ -83,6 +87,11 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         Set("RateLimiting__LoginPermitLimit", "10000");
         Set("RateLimiting__RefreshPermitLimit", "10000");
         Set("RateLimiting__WebhookPermitLimit", "10000");
+
+        // The graph host is stubbed, but the version is not optional: the client refuses to build a
+        // URL without it, and a send has to look configured for the send tests to mean anything.
+        Set("Meta__GraphApiVersion", "v21.0");
+        Set("Meta__GraphBaseUrl", "https://graph.facebook.com");
         Set("Serilog__MinimumLevel__Default", "Warning");
 
         // "dotnet test" hides the console sink, and a 500 with no exception behind it is impossible
@@ -118,6 +127,12 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+
+        // Nothing in the suite may reach Meta. The stub answers with the same JSON shape the graph
+        // host does, so the adapter sees a realistic response and no test depends on a real number.
+        builder.ConfigureTestServices(services =>
+            services.AddHttpClient<WhatsAppGraphClient>()
+                .ConfigurePrimaryHttpMessageHandler(() => StubGraph.Handler));
     }
 
     private async Task TearDownAsync()

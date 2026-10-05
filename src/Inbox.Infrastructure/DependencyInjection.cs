@@ -4,8 +4,10 @@ using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
 using Inbox.Application.Inbound;
+using Inbox.Application.Options;
 using Inbox.Infrastructure.Agents;
 using Inbox.Infrastructure.Channels;
+using Inbox.Infrastructure.Channels.WhatsApp;
 using Inbox.Infrastructure.Conversations;
 using Inbox.Infrastructure.Identity;
 using Inbox.Infrastructure.Inbound;
@@ -96,7 +98,12 @@ public static class DependencyInjection
         // One adapter per channel type; the factory resolves by ChannelType, so adding a channel is
         // a new adapter class and nothing else.
         services.AddSingleton<IChannelAdapter, TestChannelAdapter>();
+        services.AddSingleton<IChannelAdapter, WhatsAppChannelAdapter>();
         services.AddSingleton<IChannelAdapterFactory, ChannelAdapterFactory>();
+
+        // Credentials are decrypted on demand, in one place, so the webhook endpoint and the adapters
+        // never need to know about Data Protection.
+        services.AddSingleton<IChannelSecrets, ChannelSecrets>();
 
         // Channel credentials are encrypted at rest. The key ring lives outside the database
         // (user profile or the host's key store), so a database dump alone yields nothing usable.
@@ -109,6 +116,17 @@ public static class DependencyInjection
         // behind it is scoped, because it needs a DbContext per message.
         services.AddSingleton<IInboundMessageQueue, InboundMessageQueue>();
         services.AddHostedService<InboundProcessorWorker>();
+
+        // The WhatsApp Cloud API. The Graph version is configuration (Meta versions it), and sending
+        // without one fails with a message naming the setting instead of a confusing 404 - which
+        // means the webhook side keeps working on an instance that has not set it yet.
+        services.AddOptions<MetaOptions>()
+            .Bind(configuration.GetSection(MetaOptions.SectionName));
+
+        services.AddHttpClient<WhatsAppGraphClient>()
+            .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromSeconds(20));
+
+        services.AddSingleton<WhatsAppWebhookParser>();
 
         return services;
     }

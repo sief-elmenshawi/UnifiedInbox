@@ -403,15 +403,20 @@ All endpoints require JWT unless noted. Base path `/api`. Responses use a consis
 - `POST /conversations/{id}/transfer` `{targetAgentId}`
 - `POST /conversations/{id}/resolve` / `reopen`
 - `POST /conversations/{id}/read` (reset unread)
-- `POST /conversations/{id}/messages` `{text}` (later: multipart for media; template send)
+- `POST /conversations/{id}/messages` `{text}` (later: multipart for media)
+- `POST /conversations/{id}/template-messages` `{name, languageCode, bodyParameters[], category?}`
 - `GET/POST /conversations/{id}/notes` (post-MVP)
 
 ### Webhooks (anonymous, signature-protected)
 
-- `GET  /webhooks/whatsapp` | `POST /webhooks/whatsapp`
-- `GET  /webhooks/instagram` | `POST /webhooks/instagram`
-- `GET  /webhooks/facebook` | `POST /webhooks/facebook`
+- `GET  /api/webhooks/whatsapp` | `POST /api/webhooks/whatsapp`
+- `GET  /api/webhooks/instagram` | `POST /api/webhooks/instagram`
+- `GET  /api/webhooks/facebook` | `POST /api/webhooks/facebook`
 - Resolve the `Channel` row by the external account id in the payload to get the right secret.
+
+The routes are under `/api`, like every other endpoint in this API. Meta cannot present a JWT, so the
+authentication is Meta's own signature over the raw request body, checked with the secret of the channel
+the payload's phone number id resolves to.
 
 ## 8. SignalR
 
@@ -514,6 +519,45 @@ Viewers are tracked in a thread-safe in-memory store (`ConcurrentDictionary`) ke
 - Document local setup with a tunnel (ngrok / Cloudflare) in README.
 - **Done when**: a real WhatsApp test number can chat with the dashboard both ways.
 
+**Status: done except the live leg.** Everything on this side of the wire is built and tested against
+recorded payloads; the one thing no automated test can prove is a conversation with a real number,
+which needs a WhatsApp Business account, an app, a phone number and Business Verification - the
+operator's side of the setup, not code. See "Meta Setup Notes" below.
+
+Decisions taken while building it:
+
+- **The webhook authenticates with Meta's signature, not a token.** It is `AllowAnonymous` because Meta
+  cannot present a JWT, so the body is read as raw text, `metadata.phone_number_id` resolves the
+  channel, and only then is `X-Hub-Signature-256` checked with that channel's app secret. Nothing is
+  parsed into the application before the check, and the body is never re-serialised, because that would
+  change the bytes and break the HMAC.
+- A payload with no phone number id is `400` (nothing can be routed or verified). One for an unknown or
+  **deactivated** channel is `200` and dropped with a log line: Meta only retries non-2xx, and a retry
+  cannot make an unattributable payload attributable.
+- The verification handshake matches the presented token against **every** WhatsApp channel, because
+  Meta does not say which channel it is verifying and there is exactly one verify token per channel.
+- Statuses arrive out of order and are re-sent, so `ProcessStatusAsync` matches on channel **and**
+  provider message id, moves a message forward only, treats `Failed` as terminal, and ignores repeats.
+  Each accepted change raises `MessageStatusUpdated` to the thread viewers.
+- The route is `/api/webhooks/whatsapp`, under `/api` like every other endpoint; the spec's
+  `/webhooks/...` predates the API prefix convention.
+- Templates are a separate endpoint rather than a flag on the reply, because the window is exactly what
+  makes them different. `bodyParameters` are positional (`{{1}}`, `{{2}}`), and an empty list sends no
+  `components` field at all, which the provider rejects.
+- The app secret, access token and verify token are stored per channel under the same
+  `Inbox.ChannelCredentials.v1` protector as the rest of the channel secrets; `IChannelSecrets` is how
+  the adapter reads them, so no adapter touches encryption.
+- `WhatsAppGraphClient` has **no retry logic**. A failed reply is stored on the message and an agent
+  decides what to do; silently resending could duplicate a message the customer already received.
+- Media is recorded by type with its caption so the thread stays readable; the file itself is phase 6.
+- Media in a status payload (`conversation`, `pricing`) is parsed and ignored rather than rejected,
+  because Meta adds fields without warning and a strict parser would drop real deliveries.
+- The integration tests replace the graph host with `StubGraphHandler` and read recorded payloads from
+  `tests/Fixtures`, so nothing in the suite reaches Meta. `ApiFactory` sets `Meta:GraphApiVersion`,
+  because a send is refused when it is missing.
+- Covered by 25 integration tests (`WhatsAppWebhookTests`, `DeliveryStatusTests`,
+  `TemplateMessageTests`) and 34 unit tests in `Inbox.Infrastructure.Tests`.
+
 ### Phase 5 — Instagram & Facebook
 
 - Two more adapters implementing `IChannelAdapter`; no changes to Application/Domain beyond config.
@@ -541,6 +585,11 @@ Viewers are tracked in a thread-safe in-memory store (`ConcurrentDictionary`) ke
 Testcontainers, so they need a running Docker daemon and pull `mcr.microsoft.com/mssql/server:2022-latest`
 on first run. One container is shared by the whole suite, so the tests run serially: Identity's lockout
 counters are per account, and parallel logins against the same account would trip them.
+
+No test contacts Meta. `ApiFactory` swaps the graph host for `StubGraphHandler`, which answers with the
+JSON shape the real one does and records every request, so payload and failure handling can be asserted
+without a Meta account. That means a live end-to-end check stays a manual step: send a message from a
+real number, watch it arrive in the dashboard, reply, and confirm `Sent` → `Delivered` → `Read`.
 
 ## 12. Configuration (appsettings / env)
 
@@ -576,6 +625,24 @@ No real secrets committed. Provide `appsettings.Development.json.example`.
 3. Facebook/Instagram: connect a Facebook Page and the Instagram professional account; request `pages_messaging`, `instagram_manage_messages` (App Review is needed for production use with real customers; for internal use with the app owner's own accounts, development mode may be enough — verify in Meta docs).
 4. Configure webhook callback URLs and verify tokens per product.
 5. Prepare WhatsApp **message templates** (e.g., booking confirmation, follow-up) for conversations outside the 24h window.
+
+What the API needs from that work, concretely:
+
+| From Meta | Goes where |
+| --- | --- |
+| Phone number id | `externalAccountId` of a WhatsApp channel |
+| Permanent system-user access token | channel `accessToken` |
+| App secret | channel `appSecret` |
+| Any string you choose | channel `webhookVerifyToken` |
+| Graph version (e.g. `v21.0`) | `Meta:GraphApiVersion` |
+| Public callback URL | `<tunnel>/api/webhooks/whatsapp`, subscribed to the **messages** field |
+
+The callback URL has to be reachable from the internet, so local development needs a tunnel; Meta also
+offers a tunnel of its own for callbacks. Whichever is used, register the same URL for the verification
+handshake and for deliveries. The README has the `ngrok` version.
+
+Steps 1–2 and Business Verification are the parts that take time and are not code, which is why phase 4
+is otherwise complete: everything that can be verified without a live number has been.
 
 ## 14. Rules for the Coding Agent
 

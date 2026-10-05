@@ -1,3 +1,4 @@
+using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Domain.Common;
 
@@ -77,6 +78,17 @@ public sealed record ConversationMessageResponse(
 
 public sealed record SendMessageRequest(string Text);
 
+/// <summary>
+/// An approved template send. Allowed outside the 24-hour window, which is the only reason it
+/// exists: <c>bodyParameters</c> are positional and map to the <c>{{1}}</c> placeholders in the
+/// template body.
+/// </summary>
+public sealed record SendTemplateRequest(
+    string Name,
+    string LanguageCode,
+    IReadOnlyList<string> BodyParameters,
+    string? Category = null);
+
 public sealed record TransferConversationRequest(Guid TargetAgentId);
 
 public interface IConversationsService
@@ -139,5 +151,16 @@ public interface IConversationsService
         Guid agentId,
         Guid conversationId,
         string text,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends an approved template. Deliberately not blocked by the reply window: outside 24 hours a
+    /// free-form message is refused by the provider, and the template is the only legal way to reach
+    /// the customer.
+    /// </summary>
+    Task<Result<ConversationMessageResponse>> SendTemplateAsync(
+        Guid agentId,
+        Guid conversationId,
+        TemplateMessage template,
         CancellationToken cancellationToken = default);
 }

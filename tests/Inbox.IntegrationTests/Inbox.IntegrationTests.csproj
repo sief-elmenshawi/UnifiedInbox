@@ -24,6 +24,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The recorded Meta payloads are shared with the adapter tests, so a webhook test and a
+         parser test read the identical bytes. -->
+    <None Include="..\Fixtures\**\*" LinkBase="Fixtures" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Inbox.Api\Inbox.Api.csproj" />
     <ProjectReference Include="..\..\src\Inbox.Infrastructure\Inbox.Infrastructure.csproj" />
   </ItemGroup>

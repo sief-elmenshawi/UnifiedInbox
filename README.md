@@ -77,11 +77,102 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `GET` | `/api/conversations/{id}/messages?pageSize=50&before={messageId}` | Newest first. |
 | `POST` | `/api/conversations/{id}/take\|release\|transfer\|resolve\|reopen\|read` | `transfer` body: `{"targetAgentId":"…"}`. |
 | `POST` | `/api/conversations/{id}/messages` | Body `{"text":"…"}`; only inside the 24-hour reply window. |
+| `POST` | `/api/conversations/{id}/template-messages` | Body `{"name":"follow_up_quote","languageCode":"en_US","bodyParameters":["Amir"]}`; allowed even when the 24-hour window is closed. |
 | `GET` | `/api/channels` | Admin only. Secrets are never returned, only whether they are set. |
 | `POST` | `/api/channels` | Admin only. Body `{"type":"WhatsApp","displayName":"…","externalAccountId":"…","accessToken":"…"}`. |
 | `PUT` | `/api/channels/{id}` | Admin only. Omit a secret to keep the stored one. |
 | `DELETE` | `/api/channels/{id}` | Admin only. Disconnects the channel; nothing is deleted and history stays readable. |
 | `POST` | `/api/dev/simulate-inbound` | Development only, admin only. |
+
+## WhatsApp (Cloud API)
+
+Two settings decide whether sending is possible at all:
+
+| Setting | Meaning |
+| --- | --- |
+| `Meta:GraphApiVersion` | The Graph version segment, e.g. `v21.0`. Without it a send is refused rather than guessed at. |
+| `Meta:GraphBaseUrl` | Defaults to `https://graph.facebook.com`; point it somewhere else only for a proxy. |
+
+A WhatsApp channel is then connected as an admin, and the channel row holds the four secrets Meta
+needs. `externalAccountId` is the **phone number id** from the Meta dashboard, not the phone number:
+
+```powershell
+Invoke-RestMethod -Uri http://localhost:5110/api/channels -Method Post `
+    -Headers @{ Authorization = "Bearer $token" } -ContentType application/json `
+    -Body '{"type":"WhatsApp","displayName":"Support line","externalAccountId":"102290129340398","accessToken":"EAA…","appSecret":"…","webhookVerifyToken":"choose-anything"}'
+```
+
+Secrets are stored encrypted and never come back out of the API; the response only says whether each
+one is set.
+
+### The callback URL
+
+Meta has to reach the API from the internet, so a tunnel is needed in local development - ngrok or
+Cloudflare Tunnel both work:
+
+```powershell
+ngrok http 5110
+# then set the callback to https://<subdomain>.ngrok-free.app/api/webhooks/whatsapp
+```
+
+Register the callback once with the same URL for the "messages" field. Meta then verifies it and
+sends two kinds of payload to it.
+
+**Verification** is a single `GET`; the challenge is echoed back only when the mode is `subscribe` and
+the verify token matches a connected channel:
+
+```
+GET /api/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token=…&hub.challenge=1158201444
+```
+
+**Deliveries** are `POST`s. The endpoint is anonymous by necessity, so the request is authenticated
+by Meta's own signature instead: `X-Hub-Signature-256` is `sha256=` plus the HMAC-SHA256 of the raw
+body keyed with the channel's app secret. The body is read as raw text and never re-serialised, because
+that would change the bytes and break the check. A payload that fails verification is refused with
+`401`; one for an unknown or disconnected channel is acknowledged with `200` and dropped, because
+retrying could not make it attributable.
+
+Responses are `200` as soon as the events are queued. Meta retries anything slower, and a retry storm
+is worse than the work.
+
+### What the payload becomes
+
+An inbound delivery creates or updates a conversation, stores the message, and pushes
+`MessageReceived` to the agents watching the thread. Media is recorded by type with its caption so the
+thread stays readable; the file itself is downloaded in a later phase.
+
+A status delivery reports on a message we sent, so it is matched by channel **and** the provider's
+message id, and only ever moves a message forward:
+
+| Provider status | Stored as |
+| --- | --- |
+| `sent` | `Sent` |
+| `delivered` | `Delivered` |
+| `read` | `Read` |
+| `failed` | `Failed`, with the reason Meta gave |
+
+Meta re-sends and re-orders these, so a `delivered` that arrives after a `failed` is ignored, and a
+repeat changes nothing. Each accepted change is pushed as `MessageStatusUpdated` to the thread viewers.
+
+### Templates
+
+Free-form text is only accepted inside the customer's 24-hour window. An approved template is the only
+message that goes through after it, which is why it has its own endpoint and ignores the window:
+
+```
+POST /api/conversations/{id}/template-messages
+{"name":"follow_up_quote","languageCode":"en_US","bodyParameters":["Amir","245 USD"]}
+```
+
+`bodyParameters` are positional and map to the `{{1}}` placeholders in the approved template body. The
+history stores what was sent so an agent reading the thread later sees the words.
+
+### Talking to WhatsApp without an account
+
+The integration tests never reach Meta. `StubGraphHandler` replaces the graph host with recorded
+payloads and `tests/Fixtures/` holds real webhook bodies, so the signature check, the parser and the
+status handling are exercised against the bytes Meta actually sends - with a real number, token and
+Business Verification left to the operator.
 
 ## Live updates
 
@@ -123,6 +214,7 @@ dotnet test UnifiedInbox.sln                                        # everything
 dotnet test tests\Inbox.Domain.Tests                                # fast, no Docker
 dotnet test UnifiedInbox.sln --filter "FullyQualifiedName~AuthFlowTests"
 dotnet test UnifiedInbox.sln --filter "FullyQualifiedName~LiveUpdateTests"   # hub events
+dotnet test UnifiedInbox.sln --filter "FullyQualifiedName~WhatsAppWebhookTests"
 ```
 
 The integration tests run the real API against a throwaway SQL Server container (Testcontainers), so
@@ -135,7 +227,8 @@ src/Inbox.Domain          entities, enums, Result/Error - no dependencies
 src/Inbox.Application     contracts, validators, service interfaces - depends on Domain only
 src/Inbox.Infrastructure  EF Core, Identity, auth and agent services, seeder
 src/Inbox.Api             controllers, middleware, configuration, DI wiring
-tests/                    Domain.Tests, Application.Tests, IntegrationTests (WebApplicationFactory)
+tests/                    Domain.Tests, Application.Tests, Infrastructure.Tests, IntegrationTests
+tests/Fixtures            recorded WhatsApp webhook payloads, shared by both test projects
 ```
 
 ## Troubleshooting
@@ -148,7 +241,11 @@ tests/                    Domain.Tests, Application.Tests, IntegrationTests (Web
 | `401` with `auth.account_locked` | 5 wrong passwords in a row locks the account for 15 minutes. An admin can reset the password. |
 | `404` on `/api/dev/simulate-inbound` | The dev endpoints are only mapped in Development; outside it the route does not exist. |
 | `409` with `conversation.already_taken` | Another agent owns the conversation. Use `transfer` (owner or admin) instead of stealing it. |
-| `422` with `conversation.window_closed` | The last inbound message is older than 24 hours; templates are a later phase. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
+| `422` with `conversation.window_closed` | The last inbound message is older than 24 hours. Send an approved template instead: `POST /api/conversations/{id}/template-messages`. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
 | `403` on `/api/channels` | Agents cannot manage channels; only an admin can connect or disconnect one. |
+| `401` on `/api/webhooks/whatsapp` | `X-Hub-Signature-256` is missing or does not match the raw body signed with the channel's app secret. A tunnel that rewrites the body would do the same thing. |
+| `400` on `/api/webhooks/whatsapp` | The payload has no `metadata.phone_number_id`, so nothing identifies the sender. |
+| WhatsApp deliveries arrive and are all dropped | The channel was disconnected, or its `externalAccountId` is not the phone number id from the Meta dashboard. Check the API log for the channel id. |
+| A send is recorded as `Failed` with "GraphApiVersion is not configured" | `Meta:GraphApiVersion` is missing from configuration. |
 | Hub connects then immediately disconnects, or 401 with `access_token` | The token must be passed as `?access_token=` on `/hubs/inbox`; a query token is only accepted on that route. |
 | A thread event never arrives | Thread events only go to connections that called `OpenConversation` for that thread. Call it after the detail request succeeds, and again after switching threads. |

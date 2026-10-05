@@ -1,5 +1,6 @@
 using FluentValidation;
 using Inbox.Api.Extensions;
+using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
 using Inbox.Domain.Common;
@@ -20,6 +21,7 @@ namespace Inbox.Api.Controllers;
 public sealed class ConversationsController(
     IConversationsService conversations,
     IValidator<SendMessageRequest> sendValidator,
+    IValidator<SendTemplateRequest> templateValidator,
     IValidator<TransferConversationRequest> transferValidator) : ControllerBase
 {
     [HttpGet]
@@ -195,6 +197,41 @@ public sealed class ConversationsController(
             User.GetAgentId(),
             conversationId,
             request.Text,
+            cancellationToken);
+
+        return result.IsSuccess
+            ? StatusCode(StatusCodes.Status201Created, result.Value)
+            : result.Error!.ToActionResult(HttpContext);
+    }
+
+    /// <summary>
+    /// Sends an approved template. Unlike a text message this is allowed outside the 24-hour reply
+    /// window, because a template is the only message WhatsApp accepts then.
+    /// </summary>
+    [HttpPost("{conversationId:guid}/template-messages")]
+    [ProducesResponseType<ConversationMessageResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public async Task<ActionResult<ConversationMessageResponse>> SendTemplateAsync(
+        Guid conversationId,
+        [FromBody] SendTemplateRequest request,
+        CancellationToken cancellationToken)
+    {
+        var validation = await templateValidator.ValidateAsync(request, cancellationToken);
+
+        if (!validation.IsValid)
+        {
+            return validation.ToError().ToActionResult(HttpContext);
+        }
+
+        var result = await conversations.SendTemplateAsync(
+            User.GetAgentId(),
+            conversationId,
+            new TemplateMessage(
+                request.Name,
+                request.LanguageCode,
+                request.BodyParameters ?? [],
+                request.Category),
             cancellationToken);
 
         return result.IsSuccess

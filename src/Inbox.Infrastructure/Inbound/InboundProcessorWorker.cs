@@ -29,15 +29,20 @@ public sealed class InboundProcessorWorker(
                 using var scope = scopeFactory.CreateScope();
                 var processor = scope.ServiceProvider.GetRequiredService<IInboundProcessor>();
 
-                var result = await processor.ProcessAsync(message, stoppingToken);
+                // One queue carries both halves of a provider conversation: a new message from a
+                // customer, and a status report about something we sent. Same lifecycle, different
+                // work, and the status one is never fatal - an unknown id is expected sometimes.
+                var failure = message.Kind == InboundEventKind.StatusUpdate
+                    ? (await processor.ProcessStatusAsync(message, stoppingToken)).Error
+                    : (await processor.ProcessAsync(message, stoppingToken)).Error;
 
-                if (result.IsFailure)
+                if (failure is not null)
                 {
                     logger.LogWarning(
                         "Inbound event {ExternalMessageId} was rejected: {Code} {Message}",
                         message.ExternalMessageId,
-                        result.Error!.Code,
-                        result.Error.Message);
+                        failure.Code,
+                        failure.Message);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

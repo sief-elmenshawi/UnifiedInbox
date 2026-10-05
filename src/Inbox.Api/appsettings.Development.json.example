@@ -44,9 +44,16 @@
   "Cors": {
     "AllowedOrigins": [ "http://localhost:4200" ]
   },
+  "_commentMeta": "Meta:GraphApiVersion is the version segment from Meta's docs (e.g. v21.0). Without it a WhatsApp send is refused instead of guessed at. The per-channel secrets (phone number id, access token, app secret, verify token) are set through POST /api/channels, not here.",
+  "Meta": {
+    "GraphApiVersion": "CHANGE_ME_v21.0",
+    "GraphBaseUrl": "https://graph.facebook.com"
+  },
   "RateLimiting": {
     "LoginPermitLimit": 30,
-    "LoginWindowSeconds": 60
+    "LoginWindowSeconds": 60,
+    "WebhookPermitLimit": 600,
+    "WebhookWindowSeconds": 60
   },
   "Storage": {
     "RootPath": "storage"

@@ -27,7 +27,7 @@ public sealed class ChannelAdministrationTests(ApiFactory factory)
     [Fact]
     public async Task An_admin_can_connect_a_channel()
     {
-var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
         var externalAccountId = NewExternalAccountId();
 
         var (created, location) = await admin.Client.ReadCreatedAsync<ChannelResponse>(
@@ -50,7 +50,7 @@ var admin = await ApiClient.LoginAsAdminAsync(factory);
         fetched.Id.Should().Be(created.Id);
     }
 
-[Fact]
+    [Fact]
     public async Task A_credential_is_never_returned_by_the_api()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
@@ -113,7 +113,7 @@ var admin = await ApiClient.LoginAsAdminAsync(factory);
         (await agentSession.Client.PutAsync($"/api/channels/{channel.Id}", new UpdateChannelRequest("Renamed", null, null, null, null)))
             .StatusCode.Should().Be(HttpStatusCode.Forbidden);
 
-(await agentSession.Client.Http.DeleteAsync($"/api/channels/{channel.Id}"))
+        (await agentSession.Client.Http.DeleteAsync($"/api/channels/{channel.Id}"))
             .StatusCode.Should().Be(HttpStatusCode.Forbidden);
     }
 

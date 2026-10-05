@@ -511,21 +511,7 @@ public sealed class ConversationsService(
             text,
             cancellationToken);
 
-        if (result.Success)
-        {
-            message.ExternalMessageId = result.ExternalMessageId;
-            message.DeliveryStatus = DeliveryStatus.Sent;
-        }
-        else
-        {
-            message.DeliveryStatus = DeliveryStatus.Failed;
-            message.FailureReason = result.FailureReason;
-            logger.LogWarning("Outbound message {MessageId} failed: {Reason}", message.Id, result.FailureReason);
-        }
-
-// The delivery status is bookkeeping on top of an already-stored message: if this one loses
-        // a race the message is still there, so it is logged rather than turned into an error.
-        await db.SaveChangesAsync(cancellationToken);
+        await ApplySendOutcomeAsync(message, result, cancellationToken);
 
         var senderName = await db.Agents
             .AsNoTracking()
@@ -542,7 +528,7 @@ public sealed class ConversationsService(
             var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
 
             // Both audiences at once: the agents looking at the thread get the message, and the whole
-            // workspace gets the list summary so this thread moves to the top of the inbox.
+            // workspace gets the list summary so this thread floats to the top of the inbox.
             await notifier.MessageReceivedAsync(workspaceId, summary, response, cancellationToken);
             await notifier.MessageStatusUpdatedAsync(
                 workspaceId,
@@ -553,6 +539,144 @@ public sealed class ConversationsService(
         }
 
         return Result.Success(response);
+    }
+
+    /// <summary>
+    /// Sends an approved template. Outside the 24-hour window this is the only message WhatsApp
+    /// accepts, so the window is deliberately not checked here; inside it a template is still legal,
+    /// which is why this is not restricted to closed windows.
+    /// </summary>
+    public async Task<Result<ConversationMessageResponse>> SendTemplateAsync(
+        Guid agentId,
+        Guid conversationId,
+        TemplateMessage template,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(template.Name) || string.IsNullOrWhiteSpace(template.LanguageCode))
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation("conversation.template_invalid", "A template needs a name and a language code."));
+        }
+
+        var conversation = await db.Conversations
+            .Include(x => x.Channel)
+            .FirstOrDefaultAsync(x => x.Id == conversationId, cancellationToken);
+
+        if (conversation is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(NotFound());
+        }
+
+        if (conversation.Channel is not { IsActive: true })
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ChannelInactive, "The channel is deactivated."));
+        }
+
+        var recipient = await db.ContactIdentities
+            .AsNoTracking()
+            .Where(x => x.ContactId == conversation.ContactId && x.ChannelId == conversation.ChannelId)
+            .Select(x => x.ExternalId)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (recipient is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ContactIdentityMissing,
+                    "This contact is not reachable on the conversation's channel."));
+        }
+
+        var nowUtc = clock.GetUtcNow().UtcDateTime;
+
+        // The history shows what was sent, template or not, so the same text the agent typed is
+        // stored: the provider renders it, and an agent reading the thread later needs the words.
+        var preview = template.BodyParameters.Count == 0
+            ? template.Name
+            : $"{template.Name}: {string.Join(", ", template.BodyParameters)}";
+
+        var message = Message.CreateOutbound(
+            conversation.Id,
+            conversation.ChannelId,
+            agentId,
+            preview,
+            MessageType.Template,
+            nowUtc);
+
+        conversation.RecordOutbound(preview, nowUtc);
+
+        if (conversation.Status == ConversationStatus.Resolved)
+        {
+            // Reached out after the thread was closed, so it is open again.
+            conversation.Reopen();
+            db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Reopened, agentId, null));
+        }
+
+        db.Messages.Add(message);
+
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return Result.Failure<ConversationMessageResponse>(Changed());
+        }
+
+        var result = await adapters.Get(conversation.Channel.Type).SendTemplateAsync(
+            conversation.Channel,
+            recipient,
+            template,
+            cancellationToken);
+
+        await ApplySendOutcomeAsync(message, result, cancellationToken);
+
+        var senderName = await db.Agents
+            .AsNoTracking()
+            .Where(x => x.Id == agentId)
+            .Select(x => x.DisplayName)
+            .FirstOrDefaultAsync(cancellationToken) ?? string.Empty;
+
+        var response = ToMessageResponse(message, senderName);
+        var summary = await ConversationSummaries.FirstOrDefaultAsync(db, conversationId, nowUtc, cancellationToken);
+
+        if (summary is not null)
+        {
+            var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+            await notifier.MessageReceivedAsync(workspaceId, summary, response, cancellationToken);
+            await notifier.MessageStatusUpdatedAsync(
+                workspaceId,
+                conversationId,
+                message.Id,
+                message.DeliveryStatus.ToString(),
+                cancellationToken);
+        }
+
+        return Result.Success(response);
+    }
+
+    /// <summary>
+    /// Records what the provider said about a message that is already stored. Shared by the text and
+    /// template paths so a failure is stored identically; announcing is left to the caller, which
+    /// knows the full picture it wants to publish.
+    /// </summary>
+    private async Task ApplySendOutcomeAsync(Message message, SendResult result, CancellationToken cancellationToken)
+    {
+        if (result.Success)
+        {
+            message.ExternalMessageId = result.ExternalMessageId;
+            message.DeliveryStatus = DeliveryStatus.Sent;
+        }
+        else
+        {
+            message.DeliveryStatus = DeliveryStatus.Failed;
+            message.FailureReason = result.FailureReason;
+            logger.LogWarning("Outbound message {MessageId} failed: {Reason}", message.Id, result.FailureReason);
+        }
+
+        // The delivery status is bookkeeping on top of an already-stored message: if this one loses
+        // a race the message is still there, so it is logged rather than turned into an error.
+        await db.SaveChangesAsync(cancellationToken);
     }
 
     /// <summary>

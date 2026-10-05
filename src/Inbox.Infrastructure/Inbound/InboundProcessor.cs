@@ -167,6 +167,116 @@ public sealed class InboundProcessor(
     }
 
     /// <summary>
+    /// Applies a provider status report to one of our messages.
+    ///
+    /// <para>
+    /// Meta retries webhooks and does not promise ordering, so this is written to be safe under both:
+    /// an unknown message id is not an error (the send may have failed before the id was stored, and
+    /// the webhook still has to be answered as handled), and a status never moves backwards.
+    /// </para>
+    /// </summary>
+    public async Task<Result<StatusUpdateResult>> ProcessStatusAsync(
+        InboundEvent status,
+        CancellationToken cancellationToken = default)
+    {
+        if (status.Kind != InboundEventKind.StatusUpdate || status.Status is null)
+        {
+            return Result.Failure<StatusUpdateResult>(
+                Error.Validation(InboundErrors.EventInvalid, "The event carries no delivery status."));
+        }
+
+        var message = await db.Messages
+            .FirstOrDefaultAsync(
+                x => x.ChannelId == status.ChannelId && x.ExternalMessageId == status.ExternalMessageId,
+                cancellationToken);
+
+        if (message is null)
+        {
+            logger.LogInformation(
+                "Delivery status '{Status}' for unknown message {ExternalMessageId} was ignored.",
+                status.Status,
+                status.ExternalMessageId);
+
+            return Result.Failure<StatusUpdateResult>(
+                Error.NotFound("inbound.message_not_found", "No message matches that provider id."));
+        }
+
+        var incoming = status.Status.Value;
+
+        if (!ShouldApply(message.DeliveryStatus, incoming))
+        {
+            // A retry, or a late webhook that arrives after a newer one. Doing nothing is the whole
+            // point: an agent must never see a delivered message marked as read again.
+            logger.LogInformation(
+                "Delivery status '{Incoming}' for message {MessageId} was ignored (already {Current}).",
+                incoming,
+                message.Id,
+                message.DeliveryStatus);
+
+            return Result.Success(new StatusUpdateResult(
+                message.Id,
+                message.ConversationId,
+                message.DeliveryStatus,
+                Changed: false));
+        }
+
+        message.DeliveryStatus = incoming;
+
+        if (incoming == DeliveryStatus.Failed)
+        {
+            message.FailureReason = status.StatusDetail ?? "The provider reported a failed delivery.";
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
+
+        logger.LogInformation(
+            "Message {MessageId} is now {DeliveryStatus} (provider said '{ProviderStatus}').",
+            message.Id,
+            incoming,
+            status.StatusDetail ?? incoming.ToString());
+
+        // Only the agents watching the thread care about the status of one of its messages, and the
+        // notification is what turns a spinner into a tick in the dashboard.
+        if (message.Direction == MessageDirection.Outbound)
+        {
+            var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+            await notifier.MessageStatusUpdatedAsync(
+                workspaceId,
+                message.ConversationId,
+                message.Id,
+                incoming.ToString(),
+                cancellationToken);
+        }
+
+        return Result.Success(new StatusUpdateResult(
+            message.Id,
+            message.ConversationId,
+            incoming,
+            Changed: true));
+    }
+
+    /// <summary>
+    /// Statuses only move forward: Pending → Sent → Delivered → Read. A failure applies whatever the
+    /// message was, because a message that failed will never be delivered and leaving it "sent" is how
+    /// an agent ends up waiting for a reply that cannot come; once failed, nothing moves it again.
+    /// </summary>
+    private static bool ShouldApply(DeliveryStatus current, DeliveryStatus incoming)
+    {
+        if (incoming == DeliveryStatus.Failed)
+        {
+            return current != DeliveryStatus.Failed;
+        }
+
+        if (current == DeliveryStatus.Failed)
+        {
+            return false;
+        }
+
+        return incoming > current;
+    }
+
+    /// <summary>
     /// Publishes the new state to the dashboard. A first message creates the row the left list has
     /// never seen; anything after it is an update to a row that is already on screen.
     /// </summary>
