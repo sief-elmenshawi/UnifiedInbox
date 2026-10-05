@@ -1,6 +1,7 @@
 using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
+using Inbox.Application.Realtime;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
@@ -31,6 +32,8 @@ public sealed class ConversationsService(
     AppDbContext db,
     UserManager<Agent> userManager,
     IChannelAdapterFactory adapters,
+    IInboxNotifier notifier,
+    IWorkspaceContext workspaceContext,
     TimeProvider clock,
     ILogger<ConversationsService> logger) : IConversationsService
 {
@@ -75,7 +78,8 @@ public sealed class ConversationsService(
         var offset = CursorCodec.Decode(cursor);
         var nowUtc = clock.GetUtcNow().UtcDateTime;
 
-        var rows = await query
+        // Order and page on the entity first: EF cannot sort by a member of a constructor projection.
+        var page = await query
             .OrderByDescending(x => x.LastMessageAtUtc)
             .ThenByDescending(x => x.Id)
             .Skip(offset)
@@ -96,8 +100,8 @@ public sealed class ConversationsService(
                 x.WindowExpiresAtUtc != null && nowUtc < x.WindowExpiresAtUtc))
             .ToListAsync(cancellationToken);
 
-        var hasMore = rows.Count > pageSize;
-        var items = rows.Take(pageSize).ToList();
+        var hasMore = page.Count > pageSize;
+        var items = page.Take(pageSize).ToList();
 
         return Result.Success(new PagedResult<ConversationListItemResponse>(
             items,
@@ -146,6 +150,7 @@ public sealed class ConversationsService(
             .Take(pageSize + 1)
             .Select(x => new ConversationMessageResponse(
                 x.Id,
+                x.ConversationId,
                 x.Direction.ToString(),
                 x.SenderType.ToString(),
                 x.SenderAgentId,
@@ -207,6 +212,8 @@ public sealed class ConversationsService(
 
         logger.LogInformation("Conversation {ConversationId} taken by agent {AgentId}.", conversationId, agentId);
 
+        await AnnounceAsync(conversationId, assignedAgentId: agentId, cancellationToken);
+
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
 
@@ -242,6 +249,8 @@ public sealed class ConversationsService(
         }
 
         logger.LogInformation("Conversation {ConversationId} released by agent {AgentId}.", conversationId, agentId);
+
+        await AnnounceAsync(conversationId, assignedAgentId: null, cancellationToken);
 
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
@@ -308,6 +317,8 @@ public sealed class ConversationsService(
             agentId,
             targetAgentId);
 
+        await AnnounceAsync(conversationId, targetAgentId, cancellationToken);
+
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
 
@@ -337,6 +348,8 @@ public sealed class ConversationsService(
         }
 
         logger.LogInformation("Conversation {ConversationId} resolved by agent {AgentId}.", conversationId, agentId);
+
+        await AnnounceAsync(conversationId, assignedAgentId: null, cancellationToken);
 
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
@@ -376,6 +389,8 @@ public sealed class ConversationsService(
 
         logger.LogInformation("Conversation {ConversationId} reopened by agent {AgentId}.", conversationId, agentId);
 
+        await AnnounceAsync(conversationId, assignedAgentId: null, cancellationToken);
+
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
 
@@ -388,9 +403,15 @@ public sealed class ConversationsService(
             .Where(x => x.Id == conversationId)
             .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.UnreadCount, 0), cancellationToken);
 
-        return updated == 0
-            ? Result.Failure(Error.NotFound(ConversationErrors.NotFound, "Conversation not found."))
-            : Result.Success();
+        if (updated == 0)
+        {
+            return Result.Failure(Error.NotFound(ConversationErrors.NotFound, "Conversation not found."));
+        }
+
+        // ExecuteUpdate bypasses the change tracker, so the unread badge is announced explicitly.
+        await AnnounceAsync(conversationId, assignedAgentId: null, cancellationToken);
+
+        return Result.Success();
     }
 
     public async Task<Result<ConversationMessageResponse>> SendMessageAsync(
@@ -474,7 +495,7 @@ public sealed class ConversationsService(
 
         db.Messages.Add(message);
 
-try
+        try
         {
             // Stored before the provider call: a crash mid-send must not lose the agent's reply.
             await db.SaveChangesAsync(cancellationToken);
@@ -512,10 +533,63 @@ try
             .Select(x => x.DisplayName)
             .FirstOrDefaultAsync(cancellationToken) ?? string.Empty;
 
-        return Result.Success(ToMessageResponse(message, senderName));
+        var response = ToMessageResponse(message, senderName);
+
+        var summary = await ConversationSummaries.FirstOrDefaultAsync(db, conversationId, nowUtc, cancellationToken);
+
+        if (summary is not null)
+        {
+            var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+            // Both audiences at once: the agents looking at the thread get the message, and the whole
+            // workspace gets the list summary so this thread moves to the top of the inbox.
+            await notifier.MessageReceivedAsync(workspaceId, summary, response, cancellationToken);
+            await notifier.MessageStatusUpdatedAsync(
+                workspaceId,
+                conversationId,
+                message.Id,
+                message.DeliveryStatus.ToString(),
+                cancellationToken);
+        }
+
+        return Result.Success(response);
     }
 
-private async Task<bool> TrySaveAsync(Guid conversationId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Announces a committed change to everyone who may see the inbox. One extra read is the price of the
+    /// denormalised list row (contact name, channel, owner, window state) that only a query can
+    /// build; a client that misses it simply refetches.
+    /// </summary>
+    private async Task AnnounceAsync(Guid conversationId, Guid? assignedAgentId, CancellationToken cancellationToken)
+    {
+        var summary = await ConversationSummaries.FirstOrDefaultAsync(
+            db,
+            conversationId,
+            clock.GetUtcNow().UtcDateTime,
+            cancellationToken);
+
+        if (summary is null)
+        {
+            return;
+        }
+
+        var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+        await notifier.ConversationUpdatedAsync(workspaceId, summary, cancellationToken);
+
+        if (assignedAgentId.HasValue)
+        {
+            // The owner changed, which the list renders as an avatar next to the row.
+            await notifier.ConversationAssignedAsync(
+                workspaceId,
+                conversationId,
+                assignedAgentId.Value,
+                summary.AssignedAgentName ?? string.Empty,
+                cancellationToken);
+        }
+    }
+
+    private async Task<bool> TrySaveAsync(Guid conversationId, CancellationToken cancellationToken)
     {
         try
         {
@@ -676,6 +750,7 @@ private async Task<bool> TrySaveAsync(Guid conversationId, CancellationToken can
 
     private static ConversationMessageResponse ToMessageResponse(Message message, string senderName) => new(
         message.Id,
+        message.ConversationId,
         message.Direction.ToString(),
         message.SenderType.ToString(),
         message.SenderAgentId,

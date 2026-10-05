@@ -417,7 +417,18 @@ All endpoints require JWT unless noted. Base path `/api`. Responses use a consis
 
 Hub: `/hubs/inbox` (JWT via query string `access_token` for WebSockets).
 
-**Groups**: `workspace:{workspaceId}` (all agents join on connect), `conversation:{id}` (joined when an agent opens it).
+**Audiences**: every connection of a workspace sees workspace events; a thread's events go only to the
+connections that currently have that thread open. Implemented with an in-memory connection registry
+(`InboxConnectionRegistry`) that maps connection → workspace, and conversation → open connections, and
+sends with `IHubClients.Clients(connectionIds)`.
+
+**Implementation deviation — groups replaced by a connection registry.** The design above calls for
+SignalR groups (`workspace:{workspaceId}`, `conversation:{id}`). Under the in-memory
+`TestServer` used by the integration tests, `DefaultHubLifetimeManager` accepts
+`Groups.AddToGroupAsync` without error but keeps zero group memberships, so every `Clients.Group(...)`
+send is dropped while `Clients.Caller(...)` and `Clients(connectionIds)` deliver normally. The registry
+reproduces the two audiences exactly and is verifiable end to end today; a backplane such as Redis
+will be needed before more than one API instance can serve the same dashboard.
 
 **Server → client events**
 
@@ -426,14 +437,14 @@ Hub: `/hubs/inbox` (JWT via query string `access_token` for WebSockets).
 | `ConversationCreated` | conversation summary | workspace |
 | `ConversationUpdated` | summary (preview, unread, status) | workspace |
 | `ConversationAssigned` | `{conversationId, agentId, agentName}` | workspace |
-| `MessageReceived` | message DTO | conversation group + workspace summary update |
-| `MessageStatusUpdated` | `{messageId, status}` | conversation group |
-| `AgentViewing` / `AgentLeft` | `{conversationId, agentId, agentName}` | conversation group |
-| `AgentTyping` | `{conversationId, agentId, agentName}` | conversation group (others) |
+| `MessageReceived` | message DTO (carries its `conversationId`) | thread viewers + workspace summary update |
+| `MessageStatusUpdated` | `{messageId, status}` | thread viewers |
+| `AgentViewing` / `AgentLeft` | `{conversationId, agentId, agentName}` | thread viewers |
+| `AgentTyping` | `{conversationId, agentId, agentName}` | other thread viewers |
 | `AgentPresenceChanged` | `{agentId, status}` | workspace |
 
 **Client → server methods**: `OpenConversation(id)`, `CloseConversation(id)`, `Typing(id)`.
-Track viewers in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by conversation; clean up on disconnect. (Single server instance assumed; Redis backplane is a later concern.)
+Viewers are tracked in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by conversation, cleaned up on disconnect. (Single server instance assumed; Redis backplane is a later concern.)
 
 ## 9. Security Checklist
 
@@ -484,6 +495,18 @@ Track viewers in a thread-safe in-memory store (`ConcurrentDictionary`) keyed by
 
 - Hub, groups, all events from section 8, viewing/typing, presence.
 - **Done when**: two browser tabs / test clients see assignment, new messages and viewing/typing in real time.
+
+**Status: done.** Decisions taken while building it:
+
+- **Groups were replaced by a connection registry** (see the deviation note in section 8): group membership does not survive in the in-memory test host, so the audiences are resolved to connection ids and sent with `Clients(connectionIds)`. Behaviour is unchanged; the transport is.
+- `InboxNotifier` is the publish port in Application; `SignalRInboxNotifier` is the adapter registered by the Api host, so Application and Infrastructure stay unaware of SignalR.
+- Events carry the workspace id as a parameter instead of resolving it per call, because one action usually raises several events (a new message updates the list row and the open thread).
+- Every announcement costs one extra read to rebuild the denormalised list row (contact name, channel, owner, window state) that only a query can produce. A client that misses an event just refetches, so delivery is best-effort by design.
+- `ConversationMessageResponse` gained `ConversationId`, because the same DTO is the payload of `MessageReceived` and the client has to know which thread it belongs to.
+- `SendMessage` raises `MessageReceived` for the thread viewers and a list update for the workspace; `MarkRead` announces too, because `ExecuteUpdate` bypasses the change tracker.
+- Inbound messages raise `MessageReceived` only. `MessageStatusUpdated` describes outbound delivery, not an inbound arrival.
+- The token is read from `?access_token=` for the hub path only; every other route still requires the `Authorization` header.
+- Covered by 11 integration tests in `LiveUpdateTests`: per-thread isolation, assignment, list updates, viewing/typing, presence, disconnect cleanup, and rejecting an anonymous connection.
 
 ### Phase 4 — WhatsApp (real)
 

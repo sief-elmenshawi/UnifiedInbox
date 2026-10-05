@@ -83,12 +83,46 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `DELETE` | `/api/channels/{id}` | Admin only. Disconnects the channel; nothing is deleted and history stays readable. |
 | `POST` | `/api/dev/simulate-inbound` | Development only, admin only. |
 
+## Live updates
+
+The dashboard does not poll: it holds one SignalR connection and the API pushes state changes to it.
+
+```
+GET /hubs/inbox?access_token=<access token>
+```
+
+A WebSocket handshake cannot carry an `Authorization` header, so the token goes in the query string -
+and only for this route. The client sends three methods:
+
+| Method | Payload | Meaning |
+| --- | --- | --- |
+| `OpenConversation` | `conversationId` | I am looking at this thread; start sending me its messages. |
+| `CloseConversation` | `conversationId` | I left it; stop sending thread events. |
+| `Typing` | `conversationId` | I am typing; the other viewers see a typing indicator. |
+
+| Event | Sent to | Fired when |
+| --- | --- | --- |
+| `ConversationCreated` | workspace | A first inbound message created the thread. |
+| `ConversationUpdated` | workspace | Owner, status or unread count changed. |
+| `ConversationAssigned` | workspace | The thread was taken, transferred or released. |
+| `MessageReceived` | thread viewers | A message was stored, inbound or outbound. |
+| `MessageStatusUpdated` | thread viewers | An outbound message changed delivery status. |
+| `AgentViewing` / `AgentLeft` | thread viewers | Someone opened or closed the thread. |
+| `AgentTyping` | other thread viewers | Someone is typing. |
+| `AgentPresenceChanged` | workspace | Someone went online, away or offline. |
+
+Workspace events reach every signed-in agent of that workspace. Thread events reach only the
+connections that have that thread open, so an agent who never opened it is not interrupted by a
+conversation that is not on their screen. State is held in memory per API process, which is enough
+for the internal-tools scale this is built for; more than one instance would need a backplane.
+
 ## Tests
 
 ```powershell
 dotnet test UnifiedInbox.sln                                        # everything
 dotnet test tests\Inbox.Domain.Tests                                # fast, no Docker
 dotnet test UnifiedInbox.sln --filter "FullyQualifiedName~AuthFlowTests"
+dotnet test UnifiedInbox.sln --filter "FullyQualifiedName~LiveUpdateTests"   # hub events
 ```
 
 The integration tests run the real API against a throwaway SQL Server container (Testcontainers), so
@@ -116,3 +150,5 @@ tests/                    Domain.Tests, Application.Tests, IntegrationTests (Web
 | `409` with `conversation.already_taken` | Another agent owns the conversation. Use `transfer` (owner or admin) instead of stealing it. |
 | `422` with `conversation.window_closed` | The last inbound message is older than 24 hours; templates are a later phase. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
 | `403` on `/api/channels` | Agents cannot manage channels; only an admin can connect or disconnect one. |
+| Hub connects then immediately disconnects, or 401 with `access_token` | The token must be passed as `?access_token=` on `/hubs/inbox`; a query token is only accepted on that route. |
+| A thread event never arrives | Thread events only go to connections that called `OpenConversation` for that thread. Call it after the detail request succeeds, and again after switching threads. |

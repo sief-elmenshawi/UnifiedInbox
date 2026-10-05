@@ -1,10 +1,13 @@
 using FluentValidation;
 using Inbox.Api.Controllers;
 using Inbox.Api.Extensions;
+using Inbox.Api.Hubs;
 using Inbox.Api.Middleware;
+using Inbox.Api.Realtime;
 using Inbox.Application;
 using Inbox.Application.Common;
 using Inbox.Application.Options;
+using Inbox.Application.Realtime;
 using Inbox.Infrastructure;
 using Inbox.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
@@ -53,6 +56,7 @@ builder.Services.AddControllers()
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGenWithBearerAuth();
+builder.Services.AddSignalR();
 
 // AddApplication() scans the Application assembly; this covers the validators that live here
 // (the dev simulator request).
@@ -60,6 +64,13 @@ builder.Services.AddValidatorsFromAssemblyContaining<DevController>();
 
 builder.Services.AddProblemDetails();
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+
+// The live-update port. Application and Infrastructure publish through it; the SignalR adapter is
+// registered here because the hub is a transport concern of this host. The registry has to be a
+// singleton - it is the shared map of live connections and which threads they have open, and the
+// hub needs one instance while the scoped notifier needs to reach the same one.
+builder.Services.AddSingleton<InboxConnectionRegistry>();
+builder.Services.AddScoped<IInboxNotifier, SignalRInboxNotifier>();
 
 builder.Services
     .AddHealthChecks()
@@ -88,6 +99,10 @@ app.MapHealthChecks("/health/ready", new HealthCheckOptions
 });
 
 app.MapControllers();
+
+// Live inbox. The token arrives as ?access_token= because a WebSocket handshake cannot carry an
+// Authorization header; AuthenticationExtensions maps it back to the bearer scheme for this route.
+app.MapHub<InboxHub>(InboxHub.Route);
 
 await app.InitializeDatabaseAsync();
 

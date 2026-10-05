@@ -1,6 +1,7 @@
 using Inbox.Application.Agents;
 using Inbox.Application.Auth;
 using Inbox.Application.Common;
+using Inbox.Application.Realtime;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
@@ -32,6 +33,7 @@ public sealed class AgentsService(
     UserManager<Agent> userManager,
     IWorkspaceContext workspaceContext,
     IRefreshTokenService refreshTokens,
+    IInboxNotifier notifier,
     TimeProvider clock,
     ILogger<AgentsService> logger) : IAgentsService
 {
@@ -287,13 +289,34 @@ public sealed class AgentsService(
                 "Presence status must be Online, Away or Offline."));
         }
 
+        var agent = await db.Agents
+            .AsNoTracking()
+            .Where(x => x.Id == agentId)
+            .Select(x => new { x.WorkspaceId })
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (agent is null)
+        {
+            return Result.Failure(Error.NotFound(AgentErrors.NotFound, "Agent not found."));
+        }
+
         var updated = await db.Agents
             .Where(x => x.Id == agentId)
             .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.PresenceStatus, presence), cancellationToken);
 
-        return updated == 0
-            ? Result.Failure(Error.NotFound(AgentErrors.NotFound, "Agent not found."))
-            : Result.Success();
+        if (updated == 0)
+        {
+            return Result.Failure(Error.NotFound(AgentErrors.NotFound, "Agent not found."));
+        }
+
+        // The dashboard shows who is around, so the change has to reach the other agents live.
+        await notifier.AgentPresenceChangedAsync(
+            agent.WorkspaceId,
+            agentId,
+            presence.ToString(),
+            cancellationToken);
+
+        return Result.Success();
     }
 
     private static string Describe(IdentityResult result) =>

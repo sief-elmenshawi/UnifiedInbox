@@ -56,8 +56,14 @@ public sealed record ConversationEventResponse(
     string? TargetAgentName,
     DateTime CreatedAtUtc);
 
+/// <summary>
+/// The message as the thread renders it. It carries its own conversation id because it is also the
+/// payload of a live <c>MessageReceived</c> event, where the client has to know which thread it
+/// belongs to.
+/// </summary>
 public sealed record ConversationMessageResponse(
     Guid Id,
+    Guid ConversationId,
     string Direction,
     string SenderType,
     Guid? SenderAgentId,

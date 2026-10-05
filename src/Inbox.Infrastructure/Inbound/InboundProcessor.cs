@@ -1,9 +1,12 @@
 using Inbox.Application.Channels;
 using Inbox.Application.Common;
+using Inbox.Application.Conversations;
 using Inbox.Application.Inbound;
+using Inbox.Application.Realtime;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
+using Inbox.Infrastructure.Conversations;
 using Inbox.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -28,6 +31,7 @@ public static class InboundErrors
 public sealed class InboundProcessor(
     AppDbContext db,
     IWorkspaceContext workspaceContext,
+    IInboxNotifier notifier,
     TimeProvider clock,
     ILogger<InboundProcessor> logger) : IInboundProcessor
 {
@@ -152,6 +156,8 @@ public sealed class InboundProcessor(
             conversation.Id,
             created ? "created" : "reused");
 
+        await AnnounceAsync(conversation.Id, entity, created, cancellationToken);
+
         return Result.Success(new InboundProcessResult(
             conversation.Id,
             contact.Id,
@@ -159,6 +165,53 @@ public sealed class InboundProcessor(
             created,
             Duplicate: false));
     }
+
+    /// <summary>
+    /// Publishes the new state to the dashboard. A first message creates the row the left list has
+    /// never seen; anything after it is an update to a row that is already on screen.
+    /// </summary>
+    private async Task AnnounceAsync(
+        Guid conversationId,
+        Message entity,
+        bool created,
+        CancellationToken cancellationToken)
+    {
+        var summary = await ConversationSummaries.FirstOrDefaultAsync(
+            db,
+            conversationId,
+            clock.GetUtcNow().UtcDateTime,
+            cancellationToken);
+
+        if (summary is null)
+        {
+            return;
+        }
+
+        var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+        var message = ToMessageResponse(entity, string.Empty);
+
+        await notifier.MessageReceivedAsync(workspaceId, summary, message, cancellationToken);
+
+        // The message event alone would not create the row in an agent's list.
+        if (created)
+        {
+            await notifier.ConversationCreatedAsync(workspaceId, summary, cancellationToken);
+        }
+    }
+
+    private static ConversationMessageResponse ToMessageResponse(Message entity, string senderName) => new(
+        entity.Id,
+        entity.ConversationId,
+        entity.Direction.ToString(),
+        entity.SenderType.ToString(),
+        entity.SenderAgentId,
+        senderName,
+        entity.Type.ToString(),
+        entity.Text,
+        entity.ExternalMessageId,
+        entity.DeliveryStatus.ToString(),
+        entity.FailureReason,
+        entity.CreatedAtUtc);
 
     /// <summary>
     /// Turns the channel's timestamp into a trustworthy UTC instant: local or unspecified kinds are

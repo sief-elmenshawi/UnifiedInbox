@@ -1,4 +1,5 @@
 using System.Text;
+using Inbox.Api.Hubs;
 using Inbox.Application.Options;
 using Inbox.Domain.Identity;
 using Inbox.Infrastructure.Identity;
@@ -69,6 +70,7 @@ public static class AuthenticationExtensions
 
                 options.Events = new JwtBearerEvents
                 {
+                    OnMessageReceived = ReadAccessTokenFromQueryString,
                     OnTokenValidated = ValidateAgentIsStillActiveAsync
                 };
             });
@@ -87,9 +89,31 @@ public static class AuthenticationExtensions
         return services;
     }
 
+/// <summary>
+    /// The SignalR WebSocket handshake cannot carry an Authorization header - the browser API for
+    /// WebSockets has no header support at all - so the client passes the token as
+    /// <c>?access_token=</c>. This hook turns that back into the bearer scheme the rest of the app
+    /// uses. It is deliberately limited to the hub path: a query string ends up in access logs and
+    /// browser history, so no other route may fall back to it.
+    /// </summary>
+    private static Task ReadAccessTokenFromQueryString(MessageReceivedContext context)
+    {
+        var accessToken = context.Request.Query["access_token"];
+
+        if (string.IsNullOrEmpty(accessToken) ||
+            !context.HttpContext.Request.Path.StartsWithSegments(InboxHub.Route, StringComparison.OrdinalIgnoreCase))
+        {
+            return Task.CompletedTask;
+        }
+
+        context.Token = accessToken;
+
+        return Task.CompletedTask;
+    }
+
     /// <summary>
-    /// A deactivated agent or a reset password must take effect immediately instead of waiting for
-    /// the access token to expire. One indexed lookup per request is an acceptable price for an
+    /// A deactivated agent or a reset password must take effect immediately instead of waiting for the
+    /// access token to expire. One indexed lookup per request is an acceptable price for an
     /// internal tool with ~10 users; a short-lived cache would be the next step if that changed.
     /// </summary>
     private static async Task ValidateAgentIsStillActiveAsync(TokenValidatedContext context)
