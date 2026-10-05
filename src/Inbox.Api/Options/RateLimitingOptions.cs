@@ -23,10 +23,31 @@ public sealed class RateLimitingOptions
     [Range(1, 600)]
     public int RefreshWindowSeconds { get; init; } = 60;
 
-    /// <summary>Meta retries deliveries, so this is generous and only guards against a runaway sender.</summary>
-    [Range(1, 100_000)]
-    public int WebhookPermitLimit { get; init; } = 600;
+    /// <summary>
+    /// Ceiling for webhook deliveries that passed signature verification, shared by every caller.
+    ///
+    /// <para>
+    /// Deliberately high. This is a safety net against a runaway sender, not a quota: it is only reached
+    /// by traffic that proved it came from Meta, so an attacker cannot spend it by flooding unsigned
+    /// requests, and a real delivery is not refused because somebody else misbehaved. The flood case is
+    /// metered per address by <see cref="WebhookFailurePermitLimit"/> instead, where it belongs.
+    /// </para>
+    /// </summary>
+    [Range(1, 1_000_000)]
+    public int WebhookAcceptedPermitLimit { get; init; } = 10_000;
 
     [Range(1, 600)]
-    public int WebhookWindowSeconds { get; init; } = 60;
+    public int WebhookAcceptedWindowSeconds { get; init; } = 60;
+
+    /// <summary>
+    /// Webhook requests per address per window that failed their proof - a signature or verification
+    /// token that did not verify. These are the only webhook requests worth limiting tightly, and
+    /// partitioning by address is what makes it tight: the requests that matter here are guesses, and a
+    /// guess is metered against the machine making it.
+    /// </summary>
+    [Range(1, 10_000)]
+    public int WebhookFailurePermitLimit { get; init; } = 20;
+
+    [Range(1, 600)]
+    public int WebhookFailureWindowSeconds { get; init; } = 60;
 }

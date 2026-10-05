@@ -97,7 +97,16 @@ public static class DependencyInjection
 
         // One adapter per channel type; the factory resolves by ChannelType, so adding a channel is
         // a new adapter class and nothing else.
-        services.AddSingleton<IChannelAdapter, TestChannelAdapter>();
+        //
+        // The test adapter is the exception: it fabricates inbound messages and reports sends as
+        // delivered, so it is only ever registered where the simulator that drives it is available.
+        // A Test channel row that reached a production database therefore has no adapter at all,
+        // which fails loudly instead of quietly accepting fake conversations.
+        if (environment.IsDevelopment())
+        {
+            services.AddSingleton<IChannelAdapter, TestChannelAdapter>();
+        }
+
         services.AddSingleton<IChannelAdapter, WhatsAppChannelAdapter>();
         services.AddSingleton<IChannelAdapterFactory, ChannelAdapterFactory>();
 
@@ -112,10 +121,25 @@ public static class DependencyInjection
             .GetRequiredService<IDataProtectionProvider>()
             .CreateProtector(ChannelsService.ProtectorPurpose));
 
-        // The queue is a singleton so the webhook endpoint and the worker share it; the processor
-        // behind it is scoped, because it needs a DbContext per message.
-        services.AddSingleton<IInboundMessageQueue, InboundMessageQueue>();
+        // The outbox is the hand-off: the endpoint appends a verified payload, the worker drains the
+        // table. The signal is a singleton because both sides must share it, and it only ever says
+        // "there is something due" - the payload is in the database.
+        services.AddScoped<IInboundWebhookStore, WebhookEventStore>();
+        services.AddSingleton<IInboundWakeupSignal, InboundWakeupSignal>();
         services.AddHostedService<InboundProcessorWorker>();
+
+        // Retention, validated on start: a misconfigured value that silently became "purge nothing" or
+        // "purge everything" would be discovered by the disk, months later. The cross-field rule is the
+        // one that matters - failures must outlive successes, or an operator's queue would be aged out
+        // before they got to it.
+        services.AddOptions<InboundOptions>()
+            .Bind(configuration.GetSection(InboundOptions.SectionName))
+            .ValidateDataAnnotations()
+            .Validate(
+                options => options.FailedRetentionDays >= options.ProcessedRetentionDays,
+                "Inbound:FailedRetentionDays must be at least Inbound:ProcessedRetentionDays, because a " +
+                "delivery that failed is the one an operator still has to act on.")
+            .ValidateOnStart();
 
         // The WhatsApp Cloud API. The Graph version is configuration (Meta versions it), and sending
         // without one fails with a message naming the setting instead of a confusing 404 - which

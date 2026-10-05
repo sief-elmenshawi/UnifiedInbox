@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Inbox.Application.Channels;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
@@ -10,10 +11,10 @@ namespace Inbox.Infrastructure.Channels;
 /// starting with "/fail" makes the send fail, so the failure path can be exercised on purpose.
 ///
 /// <para>
-/// The webhook side is inert by design: nothing calls a Test channel over HTTP - the dev simulator
-/// posts into the same queue a real webhook would - so the parser has nothing to parse and the
-/// signature check accepts whatever it is given. A Test channel is seeded locally and never
-/// exposed to a provider.
+/// The webhook side parses a small JSON document of the same shape the dev simulator posts, so
+/// simulated traffic travels the real path: outbox row, background worker, adapter, processor.
+/// Nothing calls a Test channel over a real provider, and the signature check accepts whatever it is
+/// given because there is no provider on the other end.
 /// </para>
 /// </summary>
 public sealed class TestChannelAdapter(ILogger<TestChannelAdapter> logger) : IChannelAdapter
@@ -24,7 +25,62 @@ public sealed class TestChannelAdapter(ILogger<TestChannelAdapter> logger) : ICh
 
     public bool VerifySignature(string rawBody, string? signatureHeader, Channel channel) => true;
 
-    public IReadOnlyList<InboundEvent> ParseWebhook(string rawBody, Channel channel) => [];
+    /// <summary>
+    /// Reads one simulated message. Returns nothing for an unreadable document rather than throwing:
+    /// the worker records the delivery as handled and moves on, which is what a provider delivering
+    /// something we cannot read deserves.
+    /// </summary>
+    public IReadOnlyList<InboundEvent> ParseWebhook(string rawBody, Channel channel)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(rawBody);
+            var root = document.RootElement;
+
+            var externalContactId = Text(root, "externalContactId");
+            var externalMessageId = Text(root, "externalMessageId");
+
+            if (string.IsNullOrWhiteSpace(externalContactId) || string.IsNullOrWhiteSpace(externalMessageId))
+            {
+                logger.LogWarning("A simulated inbound payload for channel {ChannelId} had no ids.", channel.Id);
+
+                return [];
+            }
+
+            return
+            [
+                new InboundEvent(
+                    ChannelType.Test,
+                    channel.Id,
+                    externalContactId,
+                    Text(root, "displayName"),
+                    externalMessageId,
+                    Text(root, "text"),
+                    MessageType.Text,
+                    Timestamp(root))
+            ];
+        }
+        catch (JsonException exception)
+        {
+            logger.LogWarning(exception, "Could not parse a simulated inbound payload for channel {ChannelId}.", channel.Id);
+
+            return [];
+        }
+    }
+
+    private static string? Text(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static DateTime Timestamp(JsonElement root)
+    {
+        var raw = Text(root, "occurredAtUtc");
+
+        return DateTime.TryParse(raw, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsed)
+            ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+            : DateTime.UtcNow;
+    }
 
     public Task<SendResult> SendTextAsync(
         Channel channel,

@@ -80,4 +80,22 @@ public interface IInboxNotifier
         Guid agentId,
         string status,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Drops every live connection of an agent whose access is being taken away: deactivated, or had
+    /// their password reset by an admin.
+    ///
+    /// <para>
+    /// Not optional politeness. An access token is checked once, when a connection is established, so
+    /// revoking refresh tokens closes the door to the <em>next</em> login and leaves every tab that is
+    /// already open streaming the queue of an agent who is no longer entitled to see it. Closing those
+    /// connections is the only thing that acts on the access that was just withdrawn.
+    /// </para>
+    ///
+    /// <para>
+    /// Deliberately not raised when an agent changes their own password: nothing was withdrawn there,
+    /// and the tab they are using is the one they just proved they own.
+    /// </para>
+    /// </summary>
+    Task DisconnectAgentAsync(Guid agentId, CancellationToken cancellationToken = default);
 }

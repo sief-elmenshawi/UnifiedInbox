@@ -269,6 +269,101 @@ public sealed class ConversationWorkflowTests(ApiFactory factory)
     }
 
     [Fact]
+    public async Task Releasing_a_resolved_conversation_is_rejected()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Hoda Nour", "Thanks, bye");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "resolve");
+
+        // A resolved thread keeps its last owner as the record of who was working on it. Releasing it
+        // would throw that away, and a resolved thread is not work anybody is waiting on.
+        var release = await ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/release");
+
+        release.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        (await ApiClient.ReadProblemAsync(release)).ErrorCode.Should().Be(ConversationErrors.AlreadyResolved);
+
+        var stored = await ConversationScenarios.OpenAsync(admin.Client, conversation.Id);
+
+        stored.AssignedAgentId.Should().Be(owner.Id);
+        stored.Events.Should().NotContain(x => x.Type == "Released");
+    }
+
+    [Fact]
+    public async Task An_admin_can_release_resolve_and_reopen_a_conversation_owned_by_someone_else()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Rana Sobhy", "I need help");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+
+        // An agent who is off leaves threads nobody may touch, and the customer in them gets nothing. All
+        // four of the admin's powers have to work on somebody else's thread, and all four have to be
+        // visible in the thread's own history.
+        var released = await ConversationScenarios.ActionAsync(admin.Client, conversation.Id, "release");
+        released.AssignedAgentId.Should().BeNull();
+        released.Events.Should().ContainSingle(x => x.Type == "Released" && x.ActorAgentId == admin.Tokens.Agent.Id);
+
+        // Taking the thread back is what makes a transfer possible, and it is the same permission an
+        // agent has over an unassigned thread.
+        var taken = await ConversationScenarios.ActionAsync(admin.Client, conversation.Id, "take");
+        taken.AssignedAgentId.Should().Be(admin.Tokens.Agent.Id);
+
+        var colleague = await AgentScenarios.CreateAsync(admin.Client);
+
+        var transferred = await ConversationScenarios.ActionAsync(
+            admin.Client, conversation.Id, "transfer", new TransferConversationRequest(colleague.Id));
+
+        transferred.AssignedAgentId.Should().Be(colleague.Id);
+        transferred.Events.Should().ContainSingle(
+            x => x.Type == "Transferred"
+                && x.ActorAgentId == admin.Tokens.Agent.Id
+                && x.TargetAgentId == colleague.Id);
+
+        var resolved = await ConversationScenarios.ActionAsync(admin.Client, conversation.Id, "resolve");
+        resolved.Status.Should().Be("Resolved");
+        resolved.Events.Should().ContainSingle(x => x.Type == "Resolved" && x.ActorAgentId == admin.Tokens.Agent.Id);
+
+        var reopened = await ConversationScenarios.ActionAsync(admin.Client, conversation.Id, "reopen");
+        reopened.Status.Should().Be("Open");
+        reopened.Events.Should().ContainSingle(x => x.Type == "Reopened" && x.ActorAgentId == admin.Tokens.Agent.Id);
+    }
+
+    [Fact]
+    public async Task An_agent_cannot_resolve_or_reopen_a_conversation_owned_by_someone_else()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var other = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var otherSession = await ApiClient.LoginAsync(factory, other.Email, other.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Yara Fathy", "Hello");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+
+        // Closing somebody else's thread is how a customer gets left waiting on an agent who never saw
+        // the thread, so it is the owner's call. Replying is still allowed - that is what a join is.
+        var resolve = await otherSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve");
+        resolve.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        (await ApiClient.ReadProblemAsync(resolve)).ErrorCode.Should().Be(ConversationErrors.NotAssignedToYou);
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "resolve");
+
+        var reopen = await otherSession.Client.PostAsync($"/api/conversations/{conversation.Id}/reopen");
+        reopen.StatusCode.Should().Be(HttpStatusCode.Forbidden);
+        (await ApiClient.ReadProblemAsync(reopen)).ErrorCode.Should().Be(ConversationErrors.NotAssignedToYou);
+
+        var stored = await ConversationScenarios.OpenAsync(admin.Client, conversation.Id);
+
+        stored.Status.Should().Be("Resolved");
+    }
+
+    [Fact]
     public async Task Marking_read_clears_the_unread_count()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
@@ -403,12 +498,55 @@ public sealed class ConversationWorkflowTests(ApiFactory factory)
         (await ApiClient.ReadProblemAsync(loser)).ErrorCode.Should().Be(ConversationErrors.Changed);
 
         // Two resolves in a row: the second one is a conflict too, whichever check catches it first.
+        // On a fresh thread, because the race above may have left this one resolved - and a resolved
+        // thread cannot be taken, only reopened, so there would be no way to set the other half up.
+        var (_, second) = await ConversationScenarios.DeliverAsync(admin.Client, "Rania Adel", "One more");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, second.Id, "take");
+
         var resolved = await Task.WhenAll(
-            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve"),
-            ownerSession.Client.PostAsync($"/api/conversations/{conversation.Id}/resolve"));
+            ownerSession.Client.PostAsync($"/api/conversations/{second.Id}/resolve"),
+            ownerSession.Client.PostAsync($"/api/conversations/{second.Id}/resolve"));
 
         resolved.Select(x => x.StatusCode).Should().AllSatisfy(
             x => x.Should().BeOneOf(HttpStatusCode.OK, HttpStatusCode.Conflict));
+    }
+
+    [Fact]
+    public async Task Two_replies_from_the_same_agent_at_once_record_one_join()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var joiner = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var joinerSession = await ApiClient.LoginAsync(factory, joiner.Email, joiner.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Yara Nabil", "Is anybody there?");
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+
+        // Whether a reply joins the thread is decided by a pre-check, so two replies in the same moment
+        // both decide to record it. The filtered unique index is what settles that race, and losing it
+        // must cost nothing: otherwise the customer watches a message disappear because a history row
+        // collided, which is a 500 in a customer's face for something that was already recorded.
+        var responses = await Task.WhenAll(
+            joinerSession.Client.PostAsync(
+                $"/api/conversations/{conversation.Id}/messages",
+                new SendMessageRequest("Looking into it now.")),
+            joinerSession.Client.PostAsync(
+                $"/api/conversations/{conversation.Id}/messages",
+                new SendMessageRequest("One moment please.")));
+
+        // RowVersion still decides which reply owns the thread's last-message columns, so a 409 is the
+        // conversation losing that race rather than the join. Nothing else is an acceptable outcome.
+        responses.Select(x => x.StatusCode).Should().AllSatisfy(
+            x => x.Should().BeOneOf(HttpStatusCode.Created, HttpStatusCode.Conflict));
+
+        var stored = await ConversationScenarios.OpenAsync(ownerSession.Client, conversation.Id);
+
+        // One join, one row, whichever order they landed in - and the thread still belongs to the agent
+        // who took it, because joining is not taking.
+        stored.Events.Count(x => x.Type == "Joined" && x.ActorAgentId == joiner.Id).Should().Be(1);
+        stored.AssignedAgentId.Should().Be(owner.Id);
     }
 
     [Fact]

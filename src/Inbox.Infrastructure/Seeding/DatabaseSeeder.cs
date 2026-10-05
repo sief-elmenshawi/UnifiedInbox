@@ -6,6 +6,7 @@ using Inbox.Infrastructure.Channels;
 using Inbox.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -20,6 +21,12 @@ public interface IDatabaseSeeder
 /// Creates the workspace and the first admin from configuration. Idempotent: it can run on every
 /// boot and will not touch an existing admin account, so restarting the API never resets a password
 /// an admin has already changed.
+///
+/// <para>
+/// The same seeder is the Development startup path and the production <c>seed-admin</c> command; only
+/// the forced password change differs by environment, and that decision belongs here rather than in the
+/// caller because it is a property of where the password came from.
+/// </para>
 /// </summary>
 public sealed class DatabaseSeeder(
     AppDbContext db,
@@ -27,6 +34,7 @@ public sealed class DatabaseSeeder(
     RoleManager<IdentityRole<Guid>> roleManager,
     IOptions<SeedOptions> options,
     TimeProvider clock,
+    IHostEnvironment environment,
     ILogger<DatabaseSeeder> logger) : IDatabaseSeeder
 {
     public async Task SeedAsync(CancellationToken cancellationToken = default)
@@ -62,7 +70,15 @@ public sealed class DatabaseSeeder(
         }
 
         await EnsureIdentityRolesAsync(cancellationToken);
-        await EnsureTestChannelAsync(workspace, cancellationToken);
+
+        // The test channel is a development fixture, and it is a live channel while it exists: its
+        // adapter accepts simulated inbound messages and reports simulated sends as delivered. Seeding
+        // it outside Development would put a fake conversation source into a real workspace, so it is
+        // created only where POST /api/dev exists to drive it.
+        if (environment.IsDevelopment())
+        {
+            await EnsureTestChannelAsync(workspace, cancellationToken);
+        }
 
         var normalizedEmail = userManager.NormalizeEmail(seed.AdminEmail);
         var admin = await userManager.FindByEmailAsync(seed.AdminEmail);
@@ -84,9 +100,13 @@ public sealed class DatabaseSeeder(
                 : seed.AdminDisplayName,
             Role = AgentRole.Admin,
             IsActive = true,
-            // The seeded admin keeps the configured password: it is provisioned, not invited, so
-            // there is no temporary credential to replace.
-            MustChangePassword = false,
+            // Development keeps the configured password, because it is a local convenience that the
+            // developer already knows. Everywhere else the password arrived in a deployment
+            // configuration - a secret store, a pipeline variable, a shell history - and the person
+            // provisioning the instance is not necessarily the person who will use the account. So
+            // outside Development the seeded admin starts out owing a password change, exactly like an
+            // admin-created agent, and the first sign-in has to replace it before the account is usable.
+            MustChangePassword = !environment.IsDevelopment(),
             PresenceStatus = PresenceStatus.Offline,
             CreatedAtUtc = clock.GetUtcNow().UtcDateTime
         };
@@ -99,7 +119,11 @@ public sealed class DatabaseSeeder(
                 "Failed to seed the first admin: " + string.Join(" ", created.Errors.Select(x => x.Description)));
         }
 
-        logger.LogInformation("First admin {Email} seeded.", normalizedEmail);
+        logger.LogInformation(
+            environment.IsDevelopment()
+                ? "First admin {Email} seeded."
+                : "First admin {Email} seeded; the password must be changed at first sign-in.",
+            normalizedEmail);
     }
 
     /// <summary>

@@ -171,8 +171,15 @@ public sealed class InboundProcessor(
     ///
     /// <para>
     /// Meta retries webhooks and does not promise ordering, so this is written to be safe under both:
-    /// an unknown message id is not an error (the send may have failed before the id was stored, and
-    /// the webhook still has to be answered as handled), and a status never moves backwards.
+    /// a status never moves backwards, and a report that does not move the message is a no-op rather
+    /// than an error.
+    /// </para>
+    ///
+    /// <para>
+    /// An id we do not know yet is reported as <see cref="StatusUpdateOutcome.MessageNotFound"/>, not as
+    /// a failure, because it is usually a race rather than a mistake: our send call returned an id and
+    /// the report came back before the id was written to the message. The outbox retries those for a
+    /// while, and only gives up after the race has clearly not been one.
     /// </para>
     /// </summary>
     public async Task<Result<StatusUpdateResult>> ProcessStatusAsync(
@@ -193,12 +200,15 @@ public sealed class InboundProcessor(
         if (message is null)
         {
             logger.LogInformation(
-                "Delivery status '{Status}' for unknown message {ExternalMessageId} was ignored.",
+                "Delivery status '{Status}' for unknown message {ExternalMessageId} was not applied yet.",
                 status.Status,
                 status.ExternalMessageId);
 
-            return Result.Failure<StatusUpdateResult>(
-                Error.NotFound("inbound.message_not_found", "No message matches that provider id."));
+            return Result.Success(new StatusUpdateResult(
+                default,
+                default,
+                status.Status.Value,
+                StatusUpdateOutcome.MessageNotFound));
         }
 
         var incoming = status.Status.Value;
@@ -217,7 +227,7 @@ public sealed class InboundProcessor(
                 message.Id,
                 message.ConversationId,
                 message.DeliveryStatus,
-                Changed: false));
+                StatusUpdateOutcome.Unchanged));
         }
 
         message.DeliveryStatus = incoming;
@@ -253,24 +263,38 @@ public sealed class InboundProcessor(
             message.Id,
             message.ConversationId,
             incoming,
-            Changed: true));
+            StatusUpdateOutcome.Applied));
     }
 
-    /// <summary>
-    /// Statuses only move forward: Pending → Sent → Delivered → Read. A failure applies whatever the
-    /// message was, because a message that failed will never be delivered and leaving it "sent" is how
-    /// an agent ends up waiting for a reply that cannot come; once failed, nothing moves it again.
-    /// </summary>
+/// <summary>
+    /// Delivery statuses move forward: Pending → Sent → Delivered → Read.
+    ///
+    /// <para>
+    /// Read is final, because a message the customer has read is the end of the story. Failed is final
+    /// too, for the opposite reason: a message that failed will never be delivered, so nothing later
+    /// should put it back to "sent" and leave an agent waiting for a reply that cannot come.
+    /// </para>
+    ///
+    /// <para>
+    /// Which leaves a late "failed" on a message we already know is delivered. Meta has been observed to
+    /// send one, and telling an agent a message failed when the customer demonstrably has it is worse
+    /// than telling them nothing - they would apologise for a message that arrived, or chase something
+    /// that needs no chasing.
+    /// </para>
+/// </summary>
     private static bool ShouldApply(DeliveryStatus current, DeliveryStatus incoming)
     {
-        if (incoming == DeliveryStatus.Failed)
-        {
-            return current != DeliveryStatus.Failed;
-        }
-
-        if (current == DeliveryStatus.Failed)
+        // Read and Failed are final: nothing moves a message out of them.
+        if (current is DeliveryStatus.Read or DeliveryStatus.Failed)
         {
             return false;
+        }
+
+        // A failure is only news while we do not know whether the customer has the message. Once it is
+        // delivered, a "failed" report is the stale duplicate, and the delivered state is the truth.
+        if (incoming == DeliveryStatus.Failed)
+        {
+            return current < DeliveryStatus.Delivered;
         }
 
         return incoming > current;

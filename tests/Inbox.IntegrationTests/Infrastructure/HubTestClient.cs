@@ -26,6 +26,7 @@ internal sealed class HubTestClient : IAsyncDisposable
 
     private readonly HubConnection _connection;
     private readonly ConcurrentDictionary<string, TaskCompletionSource<object?>> _waiters = new();
+    private readonly TaskCompletionSource<string?> _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly List<(string Name, object? Payload)> _received = [];
     private readonly object _gate = new();
 
@@ -39,6 +40,8 @@ private HubTestClient(HubConnection connection)
         {
             _closedReason = reason?.ToString() ?? "the server closed the connection";
 
+            _closed.TrySetResult(_closedReason);
+
             return Task.CompletedTask;
         };
 
@@ -49,6 +52,13 @@ private HubTestClient(HubConnection connection)
     }
 
     private string? _closedReason;
+
+    /// <summary>
+    /// Completes when the connection ends, whoever ended it: the client stopping, or the server aborting
+    /// it. Without this a test can only poll the transport state, which is how a "the server hung up"
+    /// assertion turns into a flaky sleep.
+    /// </summary>
+    public Task<string?> Closed => _closed.Task;
 
 public static HubTestClient Create(ApiFactory factory, string? accessToken) =>
         new(new HubConnectionBuilder()

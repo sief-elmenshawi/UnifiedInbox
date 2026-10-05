@@ -92,6 +92,38 @@ public sealed class SignalRInboxNotifier(
             new AgentPresenceEvent(agentId, status),
             cancellationToken);
 
+    public async Task DisconnectAgentAsync(Guid agentId, CancellationToken cancellationToken = default)
+    {
+        var terminated = registry.TerminateAgent(agentId);
+
+        if (terminated.Count == 0)
+        {
+            // Nobody is connected. The deactivation itself is already committed, and token validation
+            // refuses the next connection attempt, so there is nothing left to do.
+            return;
+        }
+
+        logger.LogInformation(
+            "Dropped {ConnectionCount} live connection(s) of agent {AgentId} whose access was withdrawn.",
+            terminated.Count,
+            agentId);
+
+        // The hub announces its own departures from OnDisconnectedAsync, and this path never reaches it:
+        // the record was already gone by the time the transport noticed. Without these, every other tab
+        // that had one of the same threads open would keep showing a viewer who was just removed.
+        foreach (var departure in terminated
+            .SelectMany(connection => connection.Conversations.Select(conversationId =>
+                (ConversationId: conversationId, Name: connection.AgentName)))
+            .Distinct())
+        {
+            await SendAsync(
+                registry.ConversationViewers(departure.ConversationId),
+                InboxEvents.AgentLeft,
+                new AgentActivityEvent(departure.ConversationId, agentId, departure.Name),
+                cancellationToken);
+        }
+    }
+
     private Task ToWorkspaceAsync(
         string eventName,
         Guid workspaceId,

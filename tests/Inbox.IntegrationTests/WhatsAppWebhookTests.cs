@@ -181,17 +181,19 @@ public sealed class WhatsAppWebhookTests(ApiFactory factory)
     }
 
     [Fact]
-    public async Task A_payload_without_a_phone_number_id_is_a_bad_request()
+    public async Task A_payload_without_a_phone_number_id_is_acknowledged_and_dropped()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
         var channel = await WhatsAppScenarios.ConnectAsync(admin.Client);
 
-        var response = await WhatsAppScenarios.PostSignedAsync(
-            ApiClient.Anonymous(factory),
-            channel,
-            """{"object":"whatsapp_business_account","entry":[]}""");
+        var body = """{"object":"whatsapp_business_account","entry":[]}""";
 
-        response.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        var response = await WhatsAppScenarios.PostSignedAsync(ApiClient.Anonymous(factory), channel, body);
+
+        // There is no sender to verify against and no channel to route to. A 400 here would make Meta repeat
+        // the same unusable payload for days, and it is never going to become routable on the fifth attempt,
+        // so it is acknowledged and dropped - with a warning, and without logging the body itself.
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
     }
 
     [Fact]

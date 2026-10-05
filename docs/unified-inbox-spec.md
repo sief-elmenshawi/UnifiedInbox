@@ -435,6 +435,23 @@ send is dropped while `Clients.Caller(...)` and `Clients(connectionIds)` deliver
 reproduces the two audiences exactly and is verifiable end to end today; a backplane such as Redis
 will be needed before more than one API instance can serve the same dashboard.
 
+**Token lifetime and reconnecting.** The access token lives 15 minutes (`Jwt:AccessTokenMinutes`) and a
+refresh token 14 days. The contract the dashboard depends on:
+
+- The token is validated when a connection is **established** - negotiate and the first request on the
+  transport. An expired token is refused with `401`, on the hub exactly as on any other route.
+- A connection that is already established is **not** torn down when the token expires, because the
+  handshake is a single long-lived HTTP request. The 15-minute lifetime therefore bounds how long a
+  connection can *start*, not how long one can last.
+- So the client refreshes through `accessTokenFactory`: on every negotiate, and on every reconnect after
+  a failure, the factory is called again and is expected to return a token that is still valid. A
+  reconnect loop with `401`s is what an expired factory return looks like.
+- When the refresh token is also past its expiry the only way forward is a new login.
+- `Jwt:...:ClockSkew` allows 30 seconds, so a token can be rejected a moment before its stated `exp`.
+
+Pinned by `HubTokenExpiryTests`: an expired token cannot negotiate a connection, a valid one can, and
+the refusal is identical on `/api/conversations` - so the hub is not a way around the token's lifetime.
+
 **Server → client events**
 
 | Event | Payload | Sent to |
@@ -510,7 +527,7 @@ Viewers are tracked in a thread-safe in-memory store (`ConcurrentDictionary`) ke
 - `ConversationMessageResponse` gained `ConversationId`, because the same DTO is the payload of `MessageReceived` and the client has to know which thread it belongs to.
 - `SendMessage` raises `MessageReceived` for the thread viewers and a list update for the workspace; `MarkRead` announces too, because `ExecuteUpdate` bypasses the change tracker.
 - Inbound messages raise `MessageReceived` only. `MessageStatusUpdated` describes outbound delivery, not an inbound arrival.
-- The token is read from `?access_token=` for the hub path only; every other route still requires the `Authorization` header.
+- The token is read from `?access_token=` for the hub path only; every other route still requires the `Authorization` header. It never reaches the log: `AccessTokenLoggingTests` reads the API's own log file and asserts the hub requests are there while the token is not.
 - Covered by 11 integration tests in `LiveUpdateTests`: per-thread isolation, assignment, list updates, viewing/typing, presence, disconnect cleanup, and rejecting an anonymous connection.
 
 ### Phase 4 — WhatsApp (real)
@@ -555,8 +572,23 @@ Decisions taken while building it:
 - The integration tests replace the graph host with `StubGraphHandler` and read recorded payloads from
   `tests/Fixtures`, so nothing in the suite reaches Meta. `ApiFactory` sets `Meta:GraphApiVersion`,
   because a send is refused when it is missing.
-- Covered by 25 integration tests (`WhatsAppWebhookTests`, `DeliveryStatusTests`,
-  `TemplateMessageTests`) and 34 unit tests in `Inbox.Infrastructure.Tests`.
+- **Durable Webhook Outbox and Asynchronous Processing**:
+  - The webhook endpoint (`POST /api/webhooks/whatsapp`) only verifies the signature/channel and durably appends the raw payload to the `WebhookEvents` table before returning `200 OK`.
+  - An `InboundWakeupSignal` alerts `InboundProcessorWorker`, which claims batches with pessimistic row locking (`ClaimedAtUtc`), processes idempotently, recovers stale claims (> 5 min), and schedules retries (`0s, 2s, 5s, 15s, 30s`).
+  - Terminal failures set `IsFailed = true` with the final error reason.
+- **Configurable Retention & Failed Deliveries Management**:
+  - Processed events are retained for 14 days (`Inbound:ProcessedRetentionDays`), failed/poison events for 90 days (`Inbound:FailedRetentionDays`). Purging runs hourly in bounded batches (`Inbound:PurgeBatchSize = 500`).
+  - Admins can inspect and re-enqueue failed deliveries: `GET /api/admin/webhook-events/failed` and `POST /api/admin/webhook-events/{id}/retry`.
+- **Split Webhook Rate Limiting**:
+  - Valid signed deliveries use a high instance ceiling (`RateLimiting:WebhookAcceptedPermitLimit = 10000/min`).
+  - Unauthenticated / forged requests use a strict per-IP window (`RateLimiting:WebhookFailurePermitLimit = 20/min`) returning `429` with `Retry-After`.
+- **Filtered Unique Joined Index**:
+  - `IX_ConversationEvents_ConversationId_ActorAgentId_Joined` on `[Type] = N'Joined' AND [ActorAgentId] IS NOT NULL` enforces that an agent has at most one Joined event per conversation, safely handling concurrent replies.
+- **SignalR Live Session Termination**:
+  - Deactivating an agent or resetting their password immediately disconnects live SignalR connections via `Context.Abort()` and broadcasts `AgentLeft` to active thread viewers.
+- **Production Admin Bootstrap**:
+  - `seed-admin` CLI command (`dotnet run --project src/Inbox.Api -- seed-admin`) applies EF migrations and idempotently seeds the initial administrator outside Development, setting `MustChangePassword = true` on first creation.
+- Covered by integration tests across outbox persistence, retention, failed delivery retries, production bootstrap, rate limiting, and session drops.
 
 ### Phase 5 — Instagram & Facebook
 
@@ -615,6 +647,19 @@ real number, watch it arrive in the dashboard, reply, and confirm `Sent` → `De
 The rate limits are per IP because the limiter runs before the request body is read, so the account is
 not known yet. When the whole office shares one public IP, raise `LoginPermitLimit`; brute-force
 protection is the Identity lockout (5 failures, then 15 minutes), not the per-IP counter.
+
+**Implementation deviation — the webhook policy is one global bucket, not per IP.** Meta's webhook
+traffic arrives from a handful of addresses, so partitioning it by IP would give the isolation of a
+single shared counter while looking like per-caller isolation. As configured, `WebhookPermitLimit`
+(600/minute) is a flood ceiling for the whole instance, not a per-channel allowance: a burst on one
+number can spend the budget for the others, and Meta retries what it gets refused, so a rejection is
+not free. If that ceiling is ever reached in anger, the fix is to move the limit behind the verified
+payload - partition on the `phone_number_id` the signature check has already resolved - not to raise
+the number. `RateLimitingTests` proves the limiter is wired up at all, which the rest of the suite
+cannot: every other host raises the limits so the tests do not throttle themselves.
+
+Rejected requests carry `Retry-After` with the remainder of the window, so a client can back off
+instead of retrying into the limit.
 
 No real secrets committed. Provide `appsettings.Development.json.example`.
 

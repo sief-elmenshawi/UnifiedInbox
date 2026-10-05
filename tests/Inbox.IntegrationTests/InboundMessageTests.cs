@@ -2,9 +2,14 @@ using System.Net;
 using System.Net.Http.Json;
 using FluentAssertions;
 using Inbox.Api.Controllers;
+using Inbox.Application.Channels;
 using Inbox.Application.Conversations;
+using Inbox.Domain.Enums;
 using Inbox.Infrastructure.Channels;
+using Inbox.Infrastructure.Persistence;
 using Inbox.IntegrationTests.Infrastructure;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Xunit.Sdk;
 
 namespace Inbox.IntegrationTests;
@@ -154,11 +159,42 @@ public sealed class InboundMessageTests(ApiFactory factory)
         // all, which is what makes it safe to keep in the codebase.
         await using var production = new ProductionApiFactory();
 
-var response = await production.CreateClient().PostAsJsonAsync(
+        var response = await production.CreateClient().PostAsJsonAsync(
             "/api/dev/simulate-inbound",
             new SimulateInboundRequest("wa-anything", "Intruder", null, "hello", null));
 
         response.StatusCode.Should().Be(HttpStatusCode.NotFound);
+    }
+
+    [Fact]
+    public async Task The_test_channel_has_no_adapter_outside_development()
+    {
+        // The endpoint being hidden is not enough on its own: the adapter is what makes a channel live,
+        // since it fabricates inbound messages and reports sends as delivered. This host shares the
+        // database with the Development one, so the Test row really is there - what is missing is the
+        // adapter, and that is what has to be proven.
+        await using var production = new ProductionApiFactory();
+
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            (await db.Channels.AnyAsync(x => x.Type == ChannelType.Test))
+                .Should().BeTrue("otherwise this would prove nothing about the adapter registration");
+        }
+
+        var adapters = production.Services.GetRequiredService<IChannelAdapterFactory>();
+
+        adapters.Supports(ChannelType.Test)
+            .Should().BeFalse("a fake channel in production is a fake source of customer conversations");
+
+        adapters.Supports(ChannelType.WhatsApp)
+            .Should().BeTrue("the real adapters are registered as before");
+
+        // And a channel that somehow has no adapter fails loudly instead of being quietly skipped.
+        var act = () => adapters.Get(ChannelType.Test);
+
+        act.Should().Throw<InvalidOperationException>();
     }
 
     [Fact]

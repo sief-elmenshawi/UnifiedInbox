@@ -330,6 +330,11 @@ namespace Inbox.Infrastructure.Persistence.Migrations
 
                     b.HasIndex("TargetAgentId");
 
+                    b.HasIndex("ConversationId", "ActorAgentId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_ConversationEvents_ConversationId_ActorAgentId_Joined")
+                        .HasFilter("[Type] = N'Joined' AND [ActorAgentId] IS NOT NULL");
+
                     b.HasIndex("ConversationId", "CreatedAtUtc");
 
                     b.ToTable("ConversationEvents", (string)null);
@@ -510,6 +515,64 @@ namespace Inbox.Infrastructure.Persistence.Migrations
                     b.HasIndex("AgentId", "ExpiresAtUtc");
 
                     b.ToTable("RefreshTokens", (string)null);
+                });
+
+            modelBuilder.Entity("Inbox.Domain.Entities.WebhookEvent", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<Guid>("ChannelId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("ChannelType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
+                    b.Property<DateTime?>("ClaimedAtUtc")
+                        .HasColumnType("datetime2");
+
+                    b.Property<bool>("IsFailed")
+                        .HasColumnType("bit");
+
+                    b.Property<string>("LastError")
+                        .HasMaxLength(1000)
+                        .HasColumnType("nvarchar(1000)");
+
+                    b.Property<DateTime?>("NextAttemptAtUtc")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Payload")
+                        .IsRequired()
+                        .HasColumnType("nvarchar(max)");
+
+                    b.Property<int>("ProcessAttempts")
+                        .HasColumnType("int");
+
+                    b.Property<DateTime?>("ProcessedAtUtc")
+                        .HasColumnType("datetime2");
+
+                    b.Property<DateTime>("ReceivedAtUtc")
+                        .HasColumnType("datetime2");
+
+                    b.Property<string>("Signature")
+                        .HasMaxLength(512)
+                        .HasColumnType("nvarchar(512)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ProcessedAtUtc")
+                        .HasDatabaseName("IX_WebhookEvents_Failed")
+                        .HasFilter("[IsFailed] = 1");
+
+                    b.HasIndex("ChannelId", "ReceivedAtUtc");
+
+                    b.HasIndex("ProcessedAtUtc", "NextAttemptAtUtc", "ClaimedAtUtc", "ReceivedAtUtc")
+                        .HasDatabaseName("IX_WebhookEvents_Pending");
+
+                    b.ToTable("WebhookEvents", (string)null);
                 });
 
             modelBuilder.Entity("Inbox.Domain.Entities.Workspace", b =>
@@ -830,6 +893,17 @@ namespace Inbox.Infrastructure.Persistence.Migrations
                         .IsRequired();
 
                     b.Navigation("Agent");
+                });
+
+            modelBuilder.Entity("Inbox.Domain.Entities.WebhookEvent", b =>
+                {
+                    b.HasOne("Inbox.Domain.Entities.Channel", "Channel")
+                        .WithMany()
+                        .HasForeignKey("ChannelId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.Navigation("Channel");
                 });
 
             modelBuilder.Entity("Microsoft.AspNetCore.Identity.IdentityRoleClaim<System.Guid>", b =>

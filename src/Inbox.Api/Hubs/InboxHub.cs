@@ -40,7 +40,10 @@ public sealed class InboxHub(
 
     public override async Task OnConnectedAsync()
     {
-        registry.Add(Context.ConnectionId, Agent.GetAgentId(), AgentName, WorkspaceId);
+        // The abort handle goes in with the rest of the state, because it is the only thing that can
+        // close this connection once the handshake is over: a deactivation or a password reset has to be
+        // able to reach a tab that is already open, and a token is not checked again after this point.
+        registry.Add(Context.ConnectionId, Agent.GetAgentId(), AgentName, WorkspaceId, Context.Abort);
 
         await base.OnConnectedAsync();
     }

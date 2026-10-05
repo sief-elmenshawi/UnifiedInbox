@@ -39,6 +39,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options)
 
     public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
 
+    /// <summary>
+    /// Verified provider deliveries waiting to be turned into messages. See
+    /// <see cref="Entities.WebhookEvent"/> - this table is what makes a 200 from the webhook mean
+    /// "handled", not "received".
+    /// </summary>
+    public DbSet<WebhookEvent> WebhookEvents => Set<WebhookEvent>();
+
     protected override void OnModelCreating(ModelBuilder builder)
     {
         base.OnModelCreating(builder);

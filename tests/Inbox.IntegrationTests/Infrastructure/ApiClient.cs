@@ -4,6 +4,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Inbox.Application.Agents;
 using Inbox.Application.Auth;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Xunit.Sdk;
 
 namespace Inbox.IntegrationTests.Infrastructure;
@@ -15,7 +16,11 @@ internal sealed class ApiClient(HttpClient http)
 
     public HttpClient Http { get; } = http;
 
-    public static ApiClient Anonymous(ApiFactory factory) => new(factory.CreateClient());
+    /// <summary>
+    /// An unsigned client for any host in the suite, not just the main one - the rate limiting tests
+    /// have to post against a host whose limits are turned down, and the webhook is anonymous anyway.
+    /// </summary>
+    public static ApiClient Anonymous(WebApplicationFactory<Program> factory) => new(factory.CreateClient());
 
     /// <summary>Returns a client that signs its requests, together with the tokens it signed in with.</summary>
     public static async Task<Session> LoginAsync(ApiFactory factory, string email, string password)
@@ -77,6 +82,13 @@ internal sealed class ApiClient(HttpClient http)
 
     /// <summary>Unique per test so the shared database never makes a test depend on another one.</summary>
     public static string NewEmail(string prefix) => $"{prefix}.{Guid.NewGuid():N}@inbox.test";
+
+    /// <summary>
+    /// A password that satisfies Identity's defaults (length, digit, upper, lower) and is unique per
+    /// call. For the tests that supply a password rather than having one generated for them - the
+    /// production seed being the one that has to.
+    /// </summary>
+    public static string NewPassword() => $"Bootstrap-{Guid.NewGuid():N}aA1";
 
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String

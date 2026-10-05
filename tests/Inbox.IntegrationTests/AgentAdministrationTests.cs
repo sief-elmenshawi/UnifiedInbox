@@ -119,11 +119,35 @@ public sealed class AgentAdministrationTests(ApiFactory factory)
     public async Task The_last_active_admin_cannot_be_deactivated()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
+        await BeTheOnlyActiveAdminAsync(admin);
 
         var response = await admin.Client.PostAsync($"/api/agents/{admin.Tokens.Agent.Id}/deactivate");
 
         response.StatusCode.Should().Be(HttpStatusCode.Conflict);
         (await ApiClient.ReadProblemAsync(response)).ErrorCode.Should().Be(AgentErrors.LastAdminRequired);
+    }
+
+    /// <summary>
+    /// Arranges for the signed-in admin to be the only active admin, so the guard is genuinely exercised.
+    ///
+    /// <para>
+    /// Both guard tests below depend on the whole database having exactly one active admin, and the suite
+    /// shares one database: any other test that creates an admin would quietly turn these two into tests
+    /// of nothing, and the deactivation one would take the suite's own admin down with it. Assuming a
+    /// precondition the test did not establish is how that happens, so it is established here instead.
+    /// </para>
+    /// </summary>
+    private async Task BeTheOnlyActiveAdminAsync(Session admin)
+    {
+        var agents = await admin.Client.ReadAsync<IReadOnlyList<AgentListItemResponse>>(
+            await admin.Client.Http.GetAsync("/api/agents"));
+
+        foreach (var other in agents.Where(x =>
+                     x.IsActive && x.Role == "Admin" && x.Id != admin.Tokens.Agent.Id))
+        {
+            (await AgentScenarios.DeactivateAsync(admin.Client, other.Id))
+                .Should().Be(HttpStatusCode.NoContent);
+        }
     }
 
     [Fact]
@@ -168,6 +192,7 @@ public sealed class AgentAdministrationTests(ApiFactory factory)
     public async Task Renaming_an_agent_is_allowed_but_losing_the_last_admin_is_not()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
+        await BeTheOnlyActiveAdminAsync(admin);
         var agent = await AgentScenarios.CreateAsync(admin.Client);
 
         var renamed = await admin.Client.ReadAsync<AgentListItemResponse>(

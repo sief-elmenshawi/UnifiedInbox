@@ -7,7 +7,14 @@ public sealed record ConnectionState(
     Guid AgentId,
     string AgentName,
     Guid WorkspaceId,
-    ConcurrentDictionary<Guid, byte> Conversations);
+    ConcurrentDictionary<Guid, byte> Conversations,
+    Action Abort);
+
+/// <summary>A connection dropped on purpose, and the threads it had open.</summary>
+public sealed record TerminatedConnection(
+    string ConnectionId,
+    string AgentName,
+    IReadOnlyList<Guid> Conversations);
 
 /// <summary>
 /// The live audience: who is connected, to which workspace, and which conversations they have open.
@@ -21,6 +28,13 @@ public sealed record ConnectionState(
 /// </para>
 ///
 /// <para>
+/// It also keeps the only handle that can close a connection from outside a hub invocation, the
+/// connection's own <c>Abort</c>. An access token is validated once, when the connection is
+/// established, so a deactivation or a password reset has nothing to act on afterwards except the live
+/// transport - which is why "revoke the refresh tokens" is not the same answer as "stop the tab".
+/// </para>
+///
+/// <para>
 /// Single server instance is assumed; a Redis backplane would replace this class and nothing else.
 /// </para>
 /// </summary>
@@ -31,9 +45,9 @@ public sealed class InboxConnectionRegistry
     /// <summary>conversationId -> the connections that joined it.</summary>
     private readonly ConcurrentDictionary<Guid, ConcurrentDictionary<string, byte>> _viewers = new();
 
-    public ConnectionState Add(string connectionId, Guid agentId, string agentName, Guid workspaceId)
+    public ConnectionState Add(string connectionId, Guid agentId, string agentName, Guid workspaceId, Action abort)
     {
-        var state = new ConnectionState(agentId, agentName, workspaceId, new ConcurrentDictionary<Guid, byte>());
+        var state = new ConnectionState(agentId, agentName, workspaceId, new ConcurrentDictionary<Guid, byte>(), abort);
 
         _connections[connectionId] = state;
 
@@ -114,5 +128,60 @@ public sealed class InboxConnectionRegistry
         }
 
         return conversations;
+    }
+
+    /// <summary>
+    /// Drops every live connection belonging to an agent whose access was withdrawn, and reports the
+    /// threads each of them had open.
+    ///
+    /// <para>
+    /// The record is removed before the transport is aborted, which is the opposite of the order a
+    /// normal disconnect takes. It matters twice over: an aborted connection raises
+    /// <c>OnDisconnectedAsync</c> on another thread, and that path has to find nothing left to clean up
+    /// or it would announce the same departures twice; and a broadcast already in flight must not be
+    /// able to pick a connection it is about to kill.
+    /// </para>
+    ///
+    /// <para>
+    /// The caller announces the departures, because only it holds the hub context. Skipping that would
+    /// leave the other tabs showing a viewer who no longer exists - the same ghost the registry exists to
+    /// prevent.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<TerminatedConnection> TerminateAgent(Guid agentId)
+    {
+        var connectionIds = _connections
+            .Where(entry => entry.Value.AgentId == agentId)
+            .Select(entry => entry.Key)
+            .ToArray();
+
+        var terminated = new List<TerminatedConnection>(connectionIds.Length);
+
+        foreach (var connectionId in connectionIds)
+        {
+            // Read the abort handle before removing the record: the removal is what a normal disconnect
+            // would have done, and the handle is the only thing here that can close the transport.
+            if (!_connections.TryGetValue(connectionId, out var state))
+            {
+                // The tab closed on its own between the two lines. Nothing left to terminate.
+                continue;
+            }
+
+            var conversations = Remove(connectionId);
+
+            terminated.Add(new TerminatedConnection(connectionId, state.AgentName, conversations));
+
+            try
+            {
+                state.Abort();
+            }
+            catch
+            {
+                // Unreachable either way, which is the outcome we wanted, and one dead transport must
+                // not stop the next tab from being closed.
+            }
+        }
+
+        return terminated;
     }
 }

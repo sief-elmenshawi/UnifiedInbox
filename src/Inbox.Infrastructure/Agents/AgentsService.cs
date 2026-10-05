@@ -218,11 +218,15 @@ public sealed class AgentsService(
 
         if (!isActive)
         {
-            // Kill live sessions immediately instead of waiting for the access token to expire.
+            // Kill live sessions immediately instead of waiting for the access token to expire. Refreshing
+            // only closes the door to the next login, so the tabs that are already open have to be
+            // dropped too - they hold a token that is still valid and would keep streaming the queue.
             await refreshTokens.RevokeAllForAgentAsync(
                 agent.Id,
                 RefreshTokenService.ReasonDeactivated,
                 cancellationToken);
+
+            await notifier.DisconnectAgentAsync(agent.Id, cancellationToken);
         }
 
         logger.LogInformation("Agent {AgentId} {Action}.", agent.Id, isActive ? "activated" : "deactivated");
@@ -270,6 +274,10 @@ public sealed class AgentsService(
             agent.Id,
             RefreshTokenService.ReasonPasswordChanged,
             cancellationToken);
+
+        // The account is still active, so nothing refuses an open tab; the credential it was opened with
+        // is the thing that just stopped working. Same answer as a deactivation: close the connection.
+        await notifier.DisconnectAgentAsync(agent.Id, cancellationToken);
 
         logger.LogInformation("Password reset for agent {AgentId}.", agentId);
 

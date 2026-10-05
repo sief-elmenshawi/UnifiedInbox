@@ -18,9 +18,19 @@ namespace Inbox.IntegrationTests.Infrastructure;
 /// </summary>
 internal sealed class StubGraphHandler : HttpMessageHandler
 {
+    /// <summary>
+    /// A pause lasts at most this long. The suite shares one stub, so a test that forgets to resume
+    /// must not be able to hang every test after it.
+    /// </summary>
+    private static readonly TimeSpan MaxPause = TimeSpan.FromSeconds(30);
+
     private readonly ConcurrentQueue<GraphCall> _calls = new();
 
     private readonly ConcurrentQueue<GraphFailure> _failures = new();
+
+    private TaskCompletionSource? _pause;
+
+    private string? _nextMessageId;
 
     public IReadOnlyList<GraphCall> Calls => _calls.ToArray();
 
@@ -47,6 +57,22 @@ internal sealed class StubGraphHandler : HttpMessageHandler
     public void FailNextWithUnreadableBody() =>
         FailNext(1, HttpStatusCode.BadGateway, code: 0, subcode: 0, message: string.Empty);
 
+    /// <summary>
+    /// Holds the next send at the provider until <see cref="Resume"/>. This is the only way to reach the
+    /// window that matters for a delivery status: the provider has accepted the message, but the id it
+    /// handed back has not been written to our row yet, which is exactly when a "sent" webhook can
+    /// arrive for a message that does not exist as far as we are concerned.
+    /// </summary>
+    public void PauseNext() => _pause = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Resume() => _pause?.TrySetResult();
+
+    /// <summary>
+    /// Fixes the id the next successful send will report, so a test can refer to it in a webhook before it
+    /// has been issued.
+    /// </summary>
+    public void ReturnMessageId(string externalMessageId) => _nextMessageId = externalMessageId;
+
     public void Reset()
     {
         while (_calls.TryDequeue(out _))
@@ -56,6 +82,9 @@ internal sealed class StubGraphHandler : HttpMessageHandler
         while (_failures.TryDequeue(out _))
         {
         }
+
+        _pause = null;
+        _nextMessageId = null;
     }
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -89,13 +118,21 @@ internal sealed class StubGraphHandler : HttpMessageHandler
                     });
         }
 
+        if (_pause is { } pause)
+        {
+            await Task.WhenAny(pause.Task, Task.Delay(MaxPause, cancellationToken));
+        }
+
+        var messageId = _nextMessageId ?? $"wamid.{Guid.NewGuid():N}";
+        _nextMessageId = null;
+
         return Json(
             HttpStatusCode.OK,
             new
             {
                 messaging_product = "whatsapp",
                 contacts = new[] { new { input = "96550001111", wa_id = "96550001111" } },
-                messages = new[] { new { id = $"wamid.{Guid.NewGuid():N}" } }
+                messages = new[] { new { id = messageId } }
             });
     }
 

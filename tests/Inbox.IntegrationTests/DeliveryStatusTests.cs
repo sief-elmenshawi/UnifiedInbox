@@ -71,7 +71,7 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
 
         await WhatsAppScenarios.PostStatusAsync(factory, channel, "whatsapp-status-failed.json", message.ExternalMessageId!);
 
-        var stored = await MessageAsync(session.Client, conversation.Id, message.Id);
+        var stored = await WaitForStatusAsync(session.Client, conversation.Id, message.Id, "Failed");
 
         // The agent has to learn why, not just that something went wrong: WhatsApp's own wording is
         // the only useful hint, since it names the 24-hour window.
@@ -89,7 +89,10 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
         var message = await ReplyAsync(session.Client, conversation.Id);
 
         await WhatsAppScenarios.PostStatusAsync(factory, channel, "whatsapp-status-delivered.json", message.ExternalMessageId!);
+        await WaitForStatusAsync(session.Client, conversation.Id, message.Id, "Delivered");
+
         await WhatsAppScenarios.PostStatusAsync(factory, channel, "whatsapp-status-failed.json", message.ExternalMessageId!);
+        await SettleAsync();
 
         // Meta has been observed to send a stale failed after a delivered on the same message. Showing
         // a delivered message as failed would be worse than showing nothing at all.
@@ -106,7 +109,10 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
         var message = await ReplyAsync(session.Client, conversation.Id);
 
         await WhatsAppScenarios.PostStatusAsync(factory, channel, "whatsapp-status-read.json", message.ExternalMessageId!);
+        await WaitForStatusAsync(session.Client, conversation.Id, message.Id, "Read");
+
         await WhatsAppScenarios.PostStatusAsync(factory, channel, "whatsapp-status-delivered.json", message.ExternalMessageId!);
+        await SettleAsync();
 
         (await MessageAsync(session.Client, conversation.Id, message.Id)).DeliveryStatus.Should().Be("Read");
     }
@@ -133,7 +139,7 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
         second.FailureReason.Should().Be(first.FailureReason);
     }
 
-    [Fact]
+[Fact]
     public async Task A_status_for_a_message_we_never_sent_is_accepted_and_ignored()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
@@ -142,9 +148,46 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
         var response = await WhatsAppScenarios.PostStatusAsync(
             factory, channel, "whatsapp-status-delivered.json", WhatsAppScenarios.NewExternalMessageId());
 
-        // Meta only ever hears about ids we handed it, so an unknown one means a stale job or a bug.
-        // Retrying could not help either way, so the answer is 200 and nothing changes.
+        // Meta only ever hears about ids we handed it, so an unknown one means a stale job or a bug. It
+        // is retried briefly in case the send is simply not recorded yet, and then dropped - nothing about
+        // it can change the answer, so the delivery is never left pending forever.
         response.StatusCode.Should().Be(HttpStatusCode.OK);
+    }
+
+    [Fact]
+    public async Task A_status_that_arrives_before_the_send_is_stored_is_applied_when_it_is()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var (channel, conversation) = await WhatsAppScenarios.DeliverAsync(factory);
+        var agent = await AgentScenarios.CreateAsync(admin.Client);
+        var session = await ApiClient.LoginAsync(factory, agent.Email, agent.TemporaryPassword);
+
+        // The provider's id is decided before the send is issued, and the send is held at the provider, so
+        // the "delivered" webhook below lands in the window where the message row exists but its id does
+        // not yet. This is not a contrived ordering: it is what happens whenever the report beats our own
+        // write, and before the outbox it meant the status was dropped for good.
+        var pendingId = $"wamid.{Guid.NewGuid():N}";
+        StubGraph.Handler.ReturnMessageId(pendingId);
+        StubGraph.Handler.PauseNext();
+
+        var send = ReplyAsync(session.Client, conversation.Id);
+
+        var reported = await WhatsAppScenarios.PostStatusAsync(
+            factory, channel, "whatsapp-status-delivered.json", pendingId);
+
+        reported.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        // Nothing to apply it to yet: the delivery stays in the outbox instead of being thrown away.
+        StubGraph.Handler.Resume();
+
+        var message = await send;
+
+        message.ExternalMessageId.Should().Be(pendingId);
+        message.DeliveryStatus.Should().Be("Sent");
+
+        // The retry finds the id now and applies the status that arrived before it.
+        (await WaitForStatusAsync(session.Client, conversation.Id, message.Id, "Delivered"))
+            .ExternalMessageId.Should().Be(pendingId);
     }
 
     [Fact]
@@ -170,6 +213,12 @@ public sealed class DeliveryStatusTests(ApiFactory factory)
 
     private static async Task<ConversationMessageResponse> MessageAsync(ApiClient client, Guid conversationId, Guid messageId) =>
         (await ConversationScenarios.MessagesAsync(client, conversationId)).Items.Single(x => x.Id == messageId);
+
+    /// <summary>
+    /// The counterpart to waiting: a webhook that must NOT change anything still has to be given the time
+    /// to arrive and be applied, or the assertion proves nothing about the rule it is checking.
+    /// </summary>
+    private static Task SettleAsync() => Task.Delay(TimeSpan.FromSeconds(1));
 
     /// <summary>
     /// The webhook only queues, so the stored status follows the worker. Reading once would catch the

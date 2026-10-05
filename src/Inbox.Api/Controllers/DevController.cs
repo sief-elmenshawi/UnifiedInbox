@@ -1,7 +1,8 @@
+using System.Text.Json;
 using FluentValidation;
 using Inbox.Api.Extensions;
-using Inbox.Application.Channels;
 using Inbox.Application.Common;
+using Inbox.Application.Inbound;
 using Inbox.Domain.Common;
 using Inbox.Domain.Enums;
 using Inbox.Domain.Identity;
@@ -23,8 +24,9 @@ public sealed record SimulateInboundResponse(string ExternalMessageId, bool Queu
 
 /// <summary>
 /// Development-only injector for inbound traffic, so the whole stack can be exercised without Meta
-/// (section 10, phase 2). It posts into the same queue the real webhook endpoint uses, so what it
-/// proves is the real path.
+/// (section 10, phase 2). It writes a payload the Test adapter can read into the same inbound outbox
+/// the real webhook endpoint writes to, so what it proves is the real path: stored first, parsed and
+/// applied later by the worker.
 /// <para>
 /// The controller is only registered when the environment is Development - see Program.cs - and the
 /// caller must be an authenticated admin, so it can never be used to inject messages into a
@@ -36,7 +38,8 @@ public sealed record SimulateInboundResponse(string ExternalMessageId, bool Queu
 [Authorize(Policy = AuthorizationPolicies.AdminOnly)]
 [Produces("application/json")]
 public sealed class DevController(
-    IInboundMessageQueue queue,
+    IInboundWebhookStore webhooks,
+    IInboundWakeupSignal wakeup,
     AppDbContext db,
     IValidator<SimulateInboundRequest> validator) : ControllerBase
 {
@@ -55,12 +58,12 @@ public sealed class DevController(
             return validation.ToError().ToActionResult(HttpContext);
         }
 
-        var channelId = await db.Channels
+        var channel = await db.Channels
             .Where(x => x.Type == ChannelType.Test)
-            .Select(x => (Guid?)x.Id)
+            .Select(x => new { x.Id })
             .FirstOrDefaultAsync(cancellationToken);
 
-        if (channelId is null)
+        if (channel is null)
         {
             return Error.NotFound("dev.test_channel_missing", "The test channel has not been seeded.")
                 .ToActionResult(HttpContext);
@@ -70,18 +73,18 @@ public sealed class DevController(
             ? $"sim-{Guid.NewGuid():N}"
             : request.ExternalMessageId.Trim();
 
-        var inbound = new InboundEvent(
-            ChannelType.Test,
-            channelId.Value,
-            request.ExternalContactId.Trim(),
-            request.ContactDisplayName,
+        var payload = JsonSerializer.Serialize(new
+        {
+            externalContactId = request.ExternalContactId.Trim(),
+            displayName = request.ContactDisplayName,
             externalMessageId,
-            request.Text,
-            MessageType.Text,
-            request.OccurredAtUtc ?? DateTime.UtcNow);
+            text = request.Text,
+            occurredAtUtc = (request.OccurredAtUtc ?? DateTime.UtcNow).ToUniversalTime()
+        });
 
-        // Queued, not processed: the reply is fast, exactly like a Meta webhook.
-        await queue.EnqueueAsync(inbound, cancellationToken);
+        // Stored, not processed: the reply is fast, exactly like a Meta webhook.
+        await webhooks.AppendAsync(channel.Id, ChannelType.Test, payload, signature: null, cancellationToken);
+        wakeup.Signal();
 
         return Accepted(new SimulateInboundResponse(externalMessageId, Queued: true));
     }

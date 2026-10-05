@@ -39,7 +39,16 @@ Then open <http://localhost:5110/swagger>. The seeded admin is `admin@local.test
 > which the launch profile sets for you. If you must start the exe, set that variable yourself.
 
 The API creates the database schema and seeds the first admin on startup in Development only. In
-Production, migrations are a deployment step:
+Production, run migrations and seed the initial admin via the dedicated bootstrap command:
+
+```powershell
+# Applies pending EF Core migrations and idempotently seeds the first admin
+dotnet run --project src/Inbox.Api -- seed-admin
+```
+
+Outside Development, the seeded administrator is created with `MustChangePassword = true` and must
+change their temporary credentials upon initial sign-in. Alternatively, generate an idempotent SQL
+migration script for deployment pipelines:
 
 ```powershell
 dotnet ef migrations script --idempotent -o migrate.sql --project src/Inbox.Infrastructure --startup-project src/Inbox.Api
@@ -82,6 +91,8 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `POST` | `/api/channels` | Admin only. Body `{"type":"WhatsApp","displayName":"…","externalAccountId":"…","accessToken":"…"}`. |
 | `PUT` | `/api/channels/{id}` | Admin only. Omit a secret to keep the stored one. |
 | `DELETE` | `/api/channels/{id}` | Admin only. Disconnects the channel; nothing is deleted and history stays readable. |
+| `GET` | `/api/admin/webhook-events/failed?limit=50&before={id}` | Admin only. List poisoned/failed webhook deliveries. |
+| `POST` | `/api/admin/webhook-events/{id}/retry` | Admin only. Re-enqueue a failed webhook event for processing. |
 | `POST` | `/api/dev/simulate-inbound` | Development only, admin only. |
 
 ## WhatsApp (Cloud API)
@@ -132,8 +143,12 @@ that would change the bytes and break the check. A payload that fails verificati
 `401`; one for an unknown or disconnected channel is acknowledged with `200` and dropped, because
 retrying could not make it attributable.
 
-Responses are `200` as soon as the events are queued. Meta retries anything slower, and a retry storm
-is worse than the work.
+Responses are `200` as soon as the verified raw payload is durably appended to the `WebhookEvents`
+outbox table. Meta retries anything slower, and a retry storm is worse than the work. The background
+worker asynchronously claims batches, processes status and message events, and recovers from transient
+failures through exponential retries (`0s, 2s, 5s, 15s, 30s`). Successfully processed events are
+retained for 14 days; failed events are retained for 90 days (`InboundOptions`) for administrator review
+and manual re-queuing.
 
 ### What the payload becomes
 
@@ -206,6 +221,10 @@ Workspace events reach every signed-in agent of that workspace. Thread events re
 connections that have that thread open, so an agent who never opened it is not interrupted by a
 conversation that is not on their screen. State is held in memory per API process, which is enough
 for the internal-tools scale this is built for; more than one instance would need a backplane.
+
+Active WebSocket connections are tracked in `InboxConnectionRegistry`. When an agent account is
+deactivated or its password is reset by an administrator, any live hub connections are terminated
+immediately via `Context.Abort()` and an `AgentLeft` broadcast is emitted to relevant threads.
 
 ## Tests
 

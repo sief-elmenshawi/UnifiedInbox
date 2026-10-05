@@ -1,3 +1,4 @@
+using System.Text;
 using Inbox.Infrastructure.Channels.WhatsApp;
 using Inbox.Infrastructure.Persistence;
 using Inbox.Infrastructure.Seeding;
@@ -24,7 +25,15 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     public const string ClientOrigin = "http://localhost:4200";
 
     private const string DatabaseName = "InboxTests";
-    private const string SigningKey = "integration_test_signing_key_0123456789";
+
+    /// <summary>
+    /// The key this factory hands to the host, so a test can sign a token of its own - an expired one,
+    /// for instance. A test that could only use tokens the host minted could never test expiry.
+    /// </summary>
+    internal const string SigningKey = "integration_test_signing_key_0123456789";
+
+    internal const string Issuer = "inbox-integration-tests";
+    internal const string Audience = "inbox-integration-tests-api";
 
     private static readonly string[] OverriddenVariables =
     [
@@ -41,7 +50,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         "Cors__AllowedOrigins__0",
         "RateLimiting__LoginPermitLimit",
         "RateLimiting__RefreshPermitLimit",
-"RateLimiting__WebhookPermitLimit",
+        "RateLimiting__WebhookAcceptedPermitLimit",
+        "RateLimiting__WebhookFailurePermitLimit",
         "Meta__GraphApiVersion",
         "Meta__GraphBaseUrl",
         "Serilog__MinimumLevel__Default",
@@ -57,8 +67,60 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     private readonly List<IHostedService> _startedWorkers = [];
 
-    /// <summary>Where the API writes its log during the run; see <see cref="InitializeAsync"/>.</summary>
+    /// <summary>
+    /// The path handed to the file sink. Note that this is not necessarily the file on disk: Serilog's
+    /// file sink appends the date to a path with no rolling placeholder, so use
+    /// <see cref="ReadTestLogAsync"/> rather than opening this path.
+    /// </summary>
     public string TestLogPath { get; private set; } = string.Empty;
+
+    /// <summary>Whatever the API has written to its log file so far.</summary>
+    public async Task<string> ReadTestLogAsync()
+    {
+        var directory = Path.GetDirectoryName(TestLogPath)!;
+        var prefix = Path.GetFileNameWithoutExtension(TestLogPath);
+        var written = Directory.Exists(directory)
+            ? Directory.GetFiles(directory, $"{prefix}*")
+            : [];
+
+        if (written.Length == 0)
+        {
+            return string.Empty;
+        }
+
+var builder = new StringBuilder();
+
+        // Opened with FileShare so a test can read while the API still holds the sink open, and with
+        // Delete as well: the sink appends the date to the name, so a file can be rotated out from under
+        // a reader. The read is retried, because a file caught mid-write is not a broken test - and a
+        // log read that throws reports a failing suite instead of an unwritten line.
+        foreach (var file in written)
+        {
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    await using var stream = new FileStream(
+                        file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                    using var reader = new StreamReader(stream);
+
+                    builder.AppendLine(await reader.ReadToEndAsync());
+                    break;
+                }
+                catch (IOException) when (attempt < 3)
+                {
+                    await Task.Delay(50);
+                }
+                catch (FileNotFoundException)
+                {
+                    // Rotated away between the glob and the open.
+                    break;
+                }
+            }
+        }
+
+        return builder.ToString();
+    }
 
     // Explicit interface implementations: xUnit's IAsyncLifetime uses Task while
     // WebApplicationFactory uses ValueTask, so the public members keep the base signatures.
@@ -71,8 +133,8 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         await _container.StartAsync();
 
         Set("ConnectionStrings__Default", _container.GetConnectionString());
-        Set("Jwt__Issuer", "inbox-integration-tests");
-        Set("Jwt__Audience", "inbox-integration-tests-api");
+        Set("Jwt__Issuer", Issuer);
+        Set("Jwt__Audience", Audience);
         Set("Jwt__SigningKey", SigningKey);
         Set("Jwt__AccessTokenMinutes", "15");
         Set("Jwt__RefreshTokenDays", "14");
@@ -86,13 +148,23 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         // the tests themselves. Brute-force protection is covered by the Identity lockout instead.
         Set("RateLimiting__LoginPermitLimit", "10000");
         Set("RateLimiting__RefreshPermitLimit", "10000");
-        Set("RateLimiting__WebhookPermitLimit", "10000");
+
+        // Same reason for the webhook's per-address failure budget: every forged payload in the suite
+        // comes from 127.0.0.1, so a low budget would be spent by the tests testing it. The host with the
+        // limits actually turned down lives in ThrottledWebhookFactory.
+        Set("RateLimiting__WebhookAcceptedPermitLimit", "10000");
+        Set("RateLimiting__WebhookFailurePermitLimit", "10000");
 
         // The graph host is stubbed, but the version is not optional: the client refuses to build a
         // URL without it, and a send has to look configured for the send tests to mean anything.
         Set("Meta__GraphApiVersion", "v21.0");
         Set("Meta__GraphBaseUrl", "https://graph.facebook.com");
-        Set("Serilog__MinimumLevel__Default", "Warning");
+        // Information so that a *successful* request is logged, not only a failing one. The token tests
+        // need a hub line they can rely on being there, and Serilog only writes 2xx requests at Information.
+        Set("Serilog__MinimumLevel__Default", "Information");
+
+        // ...but not EF and Kestrel chatter, which is most of what a request's worth of Information is.
+        Set("Serilog__MinimumLevel__Override__Microsoft", "Warning");
 
         // "dotnet test" hides the console sink, and a 500 with no exception behind it is impossible
         // to debug, so the suite keeps its own log file next to the test binaries.

@@ -229,6 +229,14 @@ public sealed class ConversationsService(
             return Result.Failure<ConversationDetailResponse>(NotFound());
         }
 
+        if (conversation.Status != ConversationStatus.Open)
+        {
+            // A resolved thread keeps its last owner as a record of who was working on it, so releasing
+            // one would destroy the only trace of that. Reopening it is what makes it work again, and an
+            // incoming customer message reopens it by itself.
+            return Result.Failure<ConversationDetailResponse>(AlreadyResolved());
+        }
+
         if (!conversation.AssignedAgentId.HasValue)
         {
             return Result.Failure<ConversationDetailResponse>(
@@ -339,6 +347,11 @@ public sealed class ConversationsService(
             return Result.Failure<ConversationDetailResponse>(AlreadyResolved());
         }
 
+        if (!await MayManageAsync(conversation, agentId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(NotAssignedToYou());
+        }
+
         conversation.Resolve();
         db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Resolved, agentId, null));
 
@@ -370,6 +383,11 @@ public sealed class ConversationsService(
         {
             return Result.Failure<ConversationDetailResponse>(
                 Error.Conflict(ConversationErrors.NotResolved, "This conversation is already open."));
+        }
+
+        if (!await MayManageAsync(conversation, agentId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(NotAssignedToYou());
         }
 
         conversation.Reopen();
@@ -474,18 +492,16 @@ public sealed class ConversationsService(
             MessageType.Text,
             nowUtc);
 
-        conversation.RecordOutbound(text, nowUtc);
-
-        // Replying while somebody else owns the thread is a join, recorded once per agent.
-        if (!conversation.IsAssignedTo(agentId) &&
-            !await db.ConversationEvents.AnyAsync(
-                x => x.ConversationId == conversationId &&
-                     x.ActorAgentId == agentId &&
-                     x.Type == ConversationEventType.Joined,
-                cancellationToken))
+        // Replying while somebody else owns the thread is a join. Recorded on its own, before the reply,
+        // because the unique index behind it is what makes "once per agent" true rather than merely
+        // intended - and because it must not be flushed together with the reply, or losing the race would
+        // take the message down with it.
+        if (!conversation.IsAssignedTo(agentId))
         {
-            db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Joined, agentId, null));
+            await RecordJoinedEventAsync(conversationId, agentId, cancellationToken);
         }
+
+        conversation.RecordOutbound(text, nowUtc);
 
         if (conversation.Status == ConversationStatus.Resolved)
         {
@@ -602,6 +618,13 @@ public sealed class ConversationsService(
             MessageType.Template,
             nowUtc);
 
+        // A template reaching a thread somebody else owns is a join too, and leaving it out of the
+        // history would make the thread's record depend on which feature the agent used.
+        if (!conversation.IsAssignedTo(agentId))
+        {
+            await RecordJoinedEventAsync(conversationId, agentId, cancellationToken);
+        }
+
         conversation.RecordOutbound(preview, nowUtc);
 
         if (conversation.Status == ConversationStatus.Resolved)
@@ -677,6 +700,47 @@ public sealed class ConversationsService(
         // The delivery status is bookkeeping on top of an already-stored message: if this one loses
         // a race the message is still there, so it is logged rather than turned into an error.
         await db.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Records that an agent joined a thread somebody else owns, at most once.
+    ///
+    /// <para>
+    /// The pre-check keeps the common case to one query; the filtered unique index on
+    /// (ConversationId, ActorAgentId) is the guarantee. Two replies from the same agent at the same
+    /// moment both read "not joined yet", and one of the two inserts loses. That is not an error here:
+    /// the join it wanted to record is already recorded, which is the entire point of recording it. The
+    /// losing insert is detached rather than retried, because a retry would lose the same way.
+    /// </para>
+    /// </summary>
+    private async Task RecordJoinedEventAsync(Guid conversationId, Guid agentId, CancellationToken cancellationToken)
+    {
+        if (await db.ConversationEvents.AnyAsync(
+            x => x.ConversationId == conversationId
+                 && x.ActorAgentId == agentId
+                 && x.Type == ConversationEventType.Joined,
+            cancellationToken))
+        {
+            return;
+        }
+
+        var joined = Event(conversationId, ConversationEventType.Joined, agentId, null);
+
+        db.ConversationEvents.Add(joined);
+
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateException)
+        {
+            logger.LogInformation(
+                "Agent {AgentId} joined conversation {ConversationId} concurrently; keeping the first record.",
+                agentId,
+                conversationId);
+
+            db.Entry(joined).State = EntityState.Detached;
+        }
     }
 
     /// <summary>
@@ -842,17 +906,23 @@ public sealed class ConversationsService(
             events));
     }
 
-    /// <summary>Owners manage their own conversation; an admin may always step in.</summary>
+    /// <summary>
+    /// Who may change a thread's ownership or state.
+    ///
+    /// <para>
+    /// The owner may always manage their own thread, and an admin may always manage any thread -
+    /// assigned or not. The admin case is not a convenience: an agent who is off, deactivated or simply
+    /// unreachable leaves threads nobody may touch, and the customers in them get nothing. The audit
+    /// trail is what makes it safe, because every one of these actions is recorded as a ConversationEvent
+    /// with the acting agent on it, so an admin stepping in shows up in the thread's own history instead
+    /// of being invisible.
+    /// </para>
+    /// </summary>
     private async Task<bool> MayManageAsync(Conversation conversation, Guid agentId, CancellationToken cancellationToken)
     {
         if (conversation.IsAssignedTo(agentId))
         {
             return true;
-        }
-
-        if (!conversation.AssignedAgentId.HasValue)
-        {
-            return false;
         }
 
         return await db.Agents
@@ -893,7 +963,9 @@ public sealed class ConversationsService(
         Error.Conflict(ConversationErrors.AlreadyResolved, "This conversation is already resolved.");
 
     private static Error NotAssignedToYou() =>
-        Error.Forbidden(ConversationErrors.NotAssignedToYou, "This conversation is assigned to another agent.");
+        Error.Forbidden(
+            ConversationErrors.NotAssignedToYou,
+            "This conversation belongs to another agent, or to nobody yet; take it before managing it.");
 
     private static Error Changed() =>
         Error.Conflict(ConversationErrors.Changed, "The conversation changed while you were working; reload and try again.");

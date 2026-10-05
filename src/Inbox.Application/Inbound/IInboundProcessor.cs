@@ -15,8 +15,24 @@ public sealed record InboundProcessResult(
     bool CreatedConversation,
     bool Duplicate);
 
+/// <summary>What a status report turned out to be about.</summary>
+public enum StatusUpdateOutcome
+{
+    /// <summary>The message moved forward.</summary>
+    Applied = 0,
+
+    /// <summary>A repeat or a late report: the message was already at or past this status.</summary>
+    Unchanged = 1,
+
+    /// <summary>
+    /// No stored message carries that provider id. Expected - the send may not have recorded its id
+    /// yet - and the reason the outbox retries before giving up.
+    /// </summary>
+    MessageNotFound = 2
+}
+
 /// <summary>
-/// What the processor did with one status update. <see cref="Changed"/> is the counterpart of
+/// What the processor did with one status update. <see cref="Unchanged"/> is the counterpart of
 /// <see cref="InboundProcessResult.Duplicate"/>: Meta sends the same status again on every retry,
 /// and an out-of-order or repeated webhook must not move the message backwards.
 /// </summary>
@@ -24,7 +40,11 @@ public sealed record StatusUpdateResult(
     Guid MessageId,
     Guid ConversationId,
     DeliveryStatus Status,
-    bool Changed);
+    StatusUpdateOutcome Outcome)
+{
+    /// <summary>True only when this report is what moved the message.</summary>
+    public bool Changed => Outcome == StatusUpdateOutcome.Applied;
+}
 
 public interface IInboundProcessor
 {
@@ -41,8 +61,10 @@ public interface IInboundProcessor
     /// than an error, because Meta re-sends and re-orders them.
     /// </summary>
     /// <remarks>
-    /// An id that matches no stored message comes back as a failure so the worker logs it: the
-    /// webhook has already been answered, so this is there to be noticed, not to be retried.
+    /// An id that matches no stored message is reported as
+    /// <see cref="StatusUpdateOutcome.MessageNotFound"/> rather than an error: the webhook has already
+    /// been answered, and the delivery stays in the outbox until the id shows up or the retries run
+    /// out, because the common cause is our own send that has not recorded its id yet.
     /// </remarks>
     Task<Result<StatusUpdateResult>> ProcessStatusAsync(
         InboundEvent status,

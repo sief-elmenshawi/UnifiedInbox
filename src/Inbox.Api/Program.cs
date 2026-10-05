@@ -76,11 +76,31 @@ builder.Services
     .AddHealthChecks()
     .AddDbContextCheck<AppDbContext>("database", tags: ["ready"]);
 
+// A command instead of a server: apply migrations, create the first admin, exit. Handled before the
+// pipeline is built so `seed-admin` never opens a port, and before the first request could race the
+// schema it is about to change. Outside Development this is the only supported way to create the first
+// account, because startup deliberately does not migrate or seed there.
+if (DatabaseExtensions.Commands.IsCommand(args))
+{
+    var command = DatabaseExtensions.Commands.Requested(args);
+
+    var commandApp = builder.Build();
+
+    await commandApp.ApplyMigrationsAndSeedAsync();
+
+    return;
+}
+
 var app = builder.Build();
 
 app.UseExceptionHandler();
 app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseSerilogRequestLogging();
+
+// Must sit between the logging/correlation middleware and the endpoint routing so the named
+// policies ([EnableRateLimiting]) apply. Without this call the AddRateLimiter registrations in
+// AddApiRateLimiting are never activated and every endpoint is unmetered.
+app.UseRateLimiter();
 
 app.UseApiCors();
 app.UseAuthentication();
