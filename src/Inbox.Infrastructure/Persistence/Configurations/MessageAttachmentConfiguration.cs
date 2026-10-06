@@ -15,6 +15,10 @@ public sealed class MessageAttachmentConfiguration : IEntityTypeConfiguration<Me
         builder.Property(x => x.ContentType).HasMaxLength(128).IsRequired();
         builder.Property(x => x.StoragePath).HasMaxLength(512).IsRequired();
         builder.Property(x => x.ExternalMediaId).HasMaxLength(256);
+        builder.Property(x => x.UnavailableReason).HasMaxLength(512);
+
+        // One file per message, and a lookup from the message to what it carries.
+        builder.HasIndex(x => x.MessageId);
 
         builder.HasOne(x => x.Message)
             .WithMany(x => x.Attachments)

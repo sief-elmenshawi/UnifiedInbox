@@ -141,7 +141,7 @@ public sealed class ConversationsService(
             offset = newer.HasValue ? newer.Value + 1 : 0;
         }
 
-        var rows = await db.Messages
+var rows = await db.Messages
             .AsNoTracking()
             .Where(x => x.ConversationId == conversationId)
             .OrderByDescending(x => x.CreatedAtUtc)
@@ -160,7 +160,17 @@ public sealed class ConversationsService(
                 x.ExternalMessageId,
                 x.DeliveryStatus.ToString(),
                 x.FailureReason,
-                x.CreatedAtUtc))
+                x.CreatedAtUtc,
+                x.Attachments
+                    .OrderBy(a => a.Id)
+                    .Select(a => new MessageAttachmentResponse(
+                        a.Id,
+                        a.FileName,
+                        a.ContentType,
+                        a.SizeBytes,
+                        a.Availability.ToString(),
+                        a.UnavailableReason))
+                    .ToList()))
             .ToListAsync(cancellationToken);
 
         var hasMore = rows.Count > pageSize;
@@ -1000,7 +1010,7 @@ public async Task<Result<ConversationDetailResponse>> TransferAsync(
             targetAgentId,
             clock.GetUtcNow().UtcDateTime);
 
-    private static ConversationMessageResponse ToMessageResponse(Message message, string senderName) => new(
+private static ConversationMessageResponse ToMessageResponse(Message message, string senderName) => new(
         message.Id,
         message.ConversationId,
         message.Direction.ToString(),
@@ -1012,7 +1022,17 @@ public async Task<Result<ConversationDetailResponse>> TransferAsync(
         message.ExternalMessageId,
         message.DeliveryStatus.ToString(),
         message.FailureReason,
-        message.CreatedAtUtc);
+        message.CreatedAtUtc,
+        message.Attachments
+            .OrderBy(x => x.Id)
+            .Select(x => new MessageAttachmentResponse(
+                x.Id,
+                x.FileName,
+                x.ContentType,
+                x.SizeBytes,
+                x.Availability.ToString(),
+                x.UnavailableReason))
+            .ToList());
 
     private static Error NotFound() =>
         Error.NotFound(ConversationErrors.NotFound, "Conversation not found.");

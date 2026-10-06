@@ -94,6 +94,7 @@ public static class DependencyInjection
         services.AddScoped<IConversationsService, ConversationsService>();
         services.AddScoped<IChannelsService, ChannelsService>();
         services.AddScoped<IInboundProcessor, InboundProcessor>();
+services.AddScoped<IAttachmentsService, AttachmentsService>();
         services.AddScoped<IWorkspaceContext, SingleWorkspaceContext>();
         services.AddScoped<IDatabaseSeeder, DatabaseSeeder>();
 

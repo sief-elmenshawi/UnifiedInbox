@@ -25,7 +25,63 @@ public sealed record InboundEvent(
     DateTime OccurredAtUtc,
     InboundEventKind Kind = InboundEventKind.Message,
     DeliveryStatus? Status = null,
-    string? StatusDetail = null);
+    string? StatusDetail = null,
+    InboundMedia? Media = null);
+
+/// <summary>
+/// A file the provider attached to a message, as it appeared in the payload.
+/// </summary>
+/// <remarks>
+/// A reference, not bytes. Meta hands out a media id whose download URL expires in five minutes and
+/// whose id itself stops resolving after about a week, so whoever processes the event has to fetch it
+/// while the event is in hand - which is why the download is not the parser's job.
+/// <para>
+/// Everything here except <see cref="MediaId"/> is a hint from the provider and none of it is trusted:
+/// the declared type and the sha256 are used to cross-check what arrives, never to decide what it is.
+/// </para>
+/// </remarks>
+public sealed record InboundMedia(
+    string MediaId,
+    string? DeclaredContentType = null,
+    string? Sha256 = null,
+    string? FileName = null,
+    long? DeclaredSizeBytes = null);
+
+/// <summary>
+/// The bytes behind an <see cref="InboundMedia"/>, with what the provider claimed about them.
+/// </summary>
+/// <param name="Content">The downloaded bytes.</param>
+/// <param name="DeclaredContentType">The type the provider advertised. Recorded, never trusted.</param>
+/// <param name="Sha256">The digest the provider advertised, used to detect a truncated transfer.</param>
+public sealed record DownloadedMedia(byte[] Content, string? DeclaredContentType, string? Sha256);
+
+/// <summary>Codes for a media download that did not work. Every one of them is worth a retry.</summary>
+public static class MediaDownloadErrors
+{
+    /// <summary>The channel has no usable access token, so Meta cannot be asked for the file.</summary>
+    public const string NoAccessToken = "media.no_access_token";
+
+    /// <summary>Meta answered, but not with a usable media reference.</summary>
+    public const string Unavailable = "media.unavailable";
+
+    /// <summary>The provider could not be reached, or refused the request.</summary>
+    public const string ProviderUnreachable = "media.provider_unreachable";
+
+    /// <summary>No Graph API version is configured, so there is no URL to call.</summary>
+    public const string NotConfigured = "media.not_configured";
+
+    /// <summary>
+    /// The file is over the configured ceiling for its kind. Not retryable: asking again produces the
+    /// same file, so the caller records the attachment as unavailable and the message still stands.
+    /// </summary>
+    public const string TooLarge = "media.too_large";
+
+    /// <summary>
+    /// The bytes do not match the digest the provider advertised, so the transfer was truncated or
+    /// altered. Retryable: the next attempt may well come back whole.
+    /// </summary>
+    public const string Corrupt = "media.corrupt";
+}
 
 /// <summary>What a provider is telling us about an event it delivered earlier.</summary>
 public enum InboundEventKind
@@ -93,6 +149,36 @@ public interface IChannelAdapter
         Channel channel,
         string recipientExternalId,
         TemplateMessage template,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Fetches the bytes behind a media reference the provider gave us.
+    /// </summary>
+    /// <remarks>
+    /// Returns a failed <see cref="Result{TValue}"/> rather than throwing, and every failure is one the
+    /// caller should retry: the outbox owns the retry ladder, and a file the provider will give us in
+    /// thirty seconds must not be lost because the first attempt was unlucky.
+    /// <para>
+    /// <see cref="MediaDownloadErrors.TooLarge"/> is the one failure that is not a transport problem and
+    /// is not worth retrying: it is this deployment's own ceiling saying no. The caller records the
+    /// attachment as unavailable rather than asking again, so an oversized file costs one request and
+    /// still leaves a message on the thread.
+    /// </para>
+    /// <para>
+    /// A failure here is never "this file is not allowed". Whether a file may be stored is decided from
+    /// its bytes after it has arrived, by the storage layer - keeping the two apart is what lets a
+    /// transient network error be retried and a deliberately oversized file be recorded and forgotten.
+    /// </para>
+    /// </remarks>
+    /// <param name="maxBytes">
+    /// Ceiling for this particular file, worked out by the caller from its kind. The provider's own
+    /// size report is checked against it before anything is transferred, so a file over the limit is
+    /// refused in one request instead of being streamed and then discarded.
+    /// </param>
+    Task<Result<DownloadedMedia>> DownloadMediaAsync(
+        Channel channel,
+        InboundMedia media,
+        long maxBytes,
         CancellationToken cancellationToken = default);
 }
 

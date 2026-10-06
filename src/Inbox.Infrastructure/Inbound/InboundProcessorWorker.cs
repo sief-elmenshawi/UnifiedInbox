@@ -223,11 +223,18 @@ public sealed class InboundProcessorWorker(
 
         var processed = await processor.ProcessAsync(inboundEvent, cancellationToken);
 
-        // A rejected message event is a property of the event or the channel, not of the moment it was
-        // picked up, so there is nothing to retry - the reason is recorded on the row instead.
-        return processed.IsFailure
-            ? AttemptOutcome.Rejected(processed.Error!.Message)
-            : AttemptOutcome.Nothing;
+        if (processed.IsFailure)
+        {
+            // A rejected message event is a property of the event or the channel, not of the moment it
+            // was picked up, so there is nothing to retry - the reason is recorded on the row instead.
+            // The one exception is the media download: the provider may simply not be ready to hand the
+            // file over yet, so the delivery stays in the outbox and the ladder comes back for it.
+            return processed.Error!.Code == InboundErrors.MediaUnavailable
+                ? AttemptOutcome.RetryLater(processed.Error!.Message)
+                : AttemptOutcome.Rejected(processed.Error!.Message);
+        }
+
+        return AttemptOutcome.Nothing;
     }
 
     private async Task RetryOrGiveUpAsync(

@@ -2,6 +2,8 @@ using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
 using Inbox.Application.Inbound;
+using Inbox.Application.Media;
+using Inbox.Application.Options;
 using Inbox.Application.Realtime;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
@@ -10,6 +12,7 @@ using Inbox.Infrastructure.Conversations;
 using Inbox.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Inbox.Infrastructure.Inbound;
 
@@ -18,6 +21,12 @@ public static class InboundErrors
     public const string ChannelNotFound = "inbound.channel_not_found";
     public const string ChannelInactive = "inbound.channel_inactive";
     public const string EventInvalid = "inbound.event_invalid";
+
+    /// <summary>
+    /// The provider would not give us the file yet. Retryable by design: the outbox owns the retry
+    /// ladder, because the download URL is short-lived and the media id itself is not resolvable forever.
+    /// </summary>
+    public const string MediaUnavailable = "inbound.media_unavailable";
 }
 
 /// <summary>
@@ -32,11 +41,16 @@ public sealed class InboundProcessor(
     AppDbContext db,
     IWorkspaceContext workspaceContext,
     IInboxNotifier notifier,
+    IChannelAdapterFactory adapters,
+    IMediaStorage storage,
+    IOptions<MediaOptions> mediaOptions,
     TimeProvider clock,
     ILogger<InboundProcessor> logger) : IInboundProcessor
 {
     /// <summary>One retry is enough: the only conflicts possible are the unique indexes below.</summary>
     private const int MaxAttempts = 3;
+
+    private readonly MediaOptions _mediaOptions = mediaOptions.Value;
 
     public async Task<Result<InboundProcessResult>> ProcessAsync(
         InboundEvent message,
@@ -81,7 +95,7 @@ public sealed class InboundProcessor(
 
             try
             {
-                return await StoreAsync(message, cancellationToken);
+                return await StoreAsync(message, channel, cancellationToken);
             }
             catch (DbUpdateException) when (attempt < MaxAttempts)
             {
@@ -123,7 +137,7 @@ public sealed class InboundProcessor(
         return new InboundProcessResult(existing.ConversationId, contactId, existing.Id, CreatedConversation: false, Duplicate: true);
     }
 
-    private async Task<Result<InboundProcessResult>> StoreAsync(InboundEvent message, CancellationToken cancellationToken)
+    private async Task<Result<InboundProcessResult>> StoreAsync(InboundEvent message, Channel channel, CancellationToken cancellationToken)
     {
         var nowUtc = clock.GetUtcNow().UtcDateTime;
 
@@ -148,6 +162,26 @@ public sealed class InboundProcessor(
         // Counters and preview follow arrival time, the window follows the customer's timestamp.
         conversation.RecordInbound(message.Text, nowUtc, occurredAtUtc);
 
+        // Fetched before the first save because the provider's window for doing so is minutes, not hours,
+        // and because a download that fails must fail the whole event so the outbox retries it. A file we
+        // decline to keep is not a failure: it is recorded and the message stands.
+        if (message.Media is not null)
+        {
+            var attachment = await ResolveAttachmentAsync(channel, entity.Id, message.Media, message.Type, cancellationToken);
+
+            if (attachment is null)
+            {
+                logger.LogWarning(
+                    "Could not fetch media for inbound message {ExternalMessageId}; the event will be retried.",
+                    message.ExternalMessageId);
+
+                return Result.Failure<InboundProcessResult>(
+                    Error.Failure(InboundErrors.MediaUnavailable, "The media attached to this message could not be downloaded."));
+            }
+
+            entity.Attachments.Add(attachment);
+        }
+
         await db.SaveChangesAsync(cancellationToken);
 
         logger.LogInformation(
@@ -165,6 +199,157 @@ public sealed class InboundProcessor(
             created,
             Duplicate: false));
     }
+
+    /// <summary>
+    /// Turns a provider media reference into an attachment row.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three outcomes, and the difference between them is the point:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>The bytes arrived and passed every check: stored, <see cref="AttachmentAvailability.Available"/>.</item>
+    /// <item>The bytes arrived but we decline to keep them - too large, or a type not on the whitelist.
+    /// Recorded as <see cref="AttachmentAvailability.Unavailable"/> with the reason, and the message
+    /// still goes in. A customer who sent a 200 MB video gets a thread that says so, not silence.</item>
+    /// <item>The bytes did not arrive: null, which fails the event so the outbox retries. Never recorded
+    /// as unavailable, because "we could not fetch it" and "we chose not to keep it" are different facts
+    /// and only one of them is worth retrying.</item>
+    /// </list>
+    /// </remarks>
+    private async Task<MessageAttachment?> ResolveAttachmentAsync(
+        Channel channel,
+        Guid messageId,
+        InboundMedia media,
+        MessageType type,
+        CancellationToken cancellationToken)
+    {
+        // A kind we do not keep is not an error and not a download. The message already carries a
+        // placeholder saying a video or sticker arrived; asking the provider for bytes we would then
+        // refuse would only burn the channel's rate budget.
+        if (!IsStoredKind(type))
+        {
+            return MessageAttachment.NotStored(
+                messageId,
+                FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(type)),
+                media.DeclaredContentType ?? "application/octet-stream",
+                media.DeclaredSizeBytes ?? 0,
+                NotStoredReason(type),
+                media.MediaId);
+        }
+
+        var adapter = adapters.Get(channel.Type);
+
+        var download = await adapter.DownloadMediaAsync(channel, media, CeilingFor(type), cancellationToken);
+
+        if (download.IsFailure)
+        {
+            if (download.Error!.Code == MediaDownloadErrors.TooLarge)
+            {
+                // Our own ceiling said no before anything was transferred. That is a decision, not a
+                // transport failure, so it is recorded on the message instead of asking the provider
+                // again for the same oversized file.
+                logger.LogInformation(
+                    "Media {MediaId} for message {MessageId} was over the ceiling for {Type}: {Reason}",
+                    media.MediaId,
+                    messageId,
+                    type,
+                    download.Error.Message);
+
+                return MessageAttachment.Unavailable(
+                    messageId,
+                    FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(type)),
+                    media.DeclaredContentType ?? "application/octet-stream",
+                    media.DeclaredSizeBytes ?? 0,
+                    download.Error.Message,
+                    media.MediaId);
+            }
+
+            return null;
+        }
+
+        var bytes = download.Value.Content;
+
+        var validation = storage.Validate(bytes, download.Value.DeclaredContentType, bytes.LongLength);
+
+        if (!validation.Accepted)
+        {
+            logger.LogInformation(
+                "Media {MediaId} for message {MessageId} was not stored: {Reason}",
+                media.MediaId,
+                messageId,
+                validation.Message);
+
+            return MessageAttachment.Unavailable(
+                messageId,
+                FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(type)),
+                download.Value.DeclaredContentType ?? "application/octet-stream",
+                bytes.LongLength,
+                validation.Message!,
+                media.MediaId);
+        }
+
+        // The extension comes from what the bytes turned out to be, never from the name the sender
+        // chose, so a ".html" name on text bytes cannot produce a file a browser would execute.
+        var contentType = FileSignature.Detect(bytes.AsSpan()) ?? "application/octet-stream";
+
+        var storagePath = await storage.SaveAsync(bytes, FileSignature.ExtensionFor(contentType), cancellationToken);
+
+        return MessageAttachment.Stored(
+            messageId,
+            FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(type)),
+            contentType,
+            bytes.LongLength,
+            storagePath,
+            media.MediaId);
+    }
+
+    /// <summary>
+    /// The kinds this deployment keeps. Images and documents are the ones agents actually need on the
+    /// thread; audio is here because losing a customer's voice note loses their request.
+    /// </summary>
+    private static bool IsStoredKind(MessageType type) =>
+        type is MessageType.Image or MessageType.Document or MessageType.Audio;
+
+    /// <summary>
+    /// How large this particular file may be, so the provider's own size report can be checked before
+    /// anything is transferred. The global ceiling always applies on top: it is the last line of defence,
+    /// so the strictest of the two numbers is the one handed over.
+    /// </summary>
+    private long CeilingFor(MessageType type)
+    {
+        var kind = type switch
+        {
+            MessageType.Image => _mediaOptions.Images.MaxSizeBytes,
+            MessageType.Document => _mediaOptions.Documents.MaxSizeBytes,
+            MessageType.Audio => _mediaOptions.Audio.MaxSizeBytes,
+            // Not reached - kinds we do not keep are never downloaded - but defaults rather than
+            // trusting that, so a change to IsStoredKind cannot silently hand over an unlimited ceiling.
+            _ => _mediaOptions.MaxFileSizeBytes
+        };
+
+        return Math.Min(kind, _mediaOptions.MaxFileSizeBytes);
+    }
+
+    private static string FallbackFileName(MessageType type) => type switch
+    {
+        MessageType.Image => "image",
+        MessageType.Document => "document",
+        MessageType.Audio => "voice-note",
+        MessageType.Video => "video",
+        MessageType.Sticker => "sticker",
+        _ => "attachment"
+    };
+
+    /// <summary>
+    /// Wording an agent can act on: the customer sent something real, we deliberately did not keep it.
+    /// </summary>
+    private static string NotStoredReason(MessageType type) => type switch
+    {
+        MessageType.Video => "The customer sent a video. Videos are not downloaded; ask them to send it as a document if you need it.",
+        MessageType.Sticker => "The customer sent a sticker. Stickers are not downloaded.",
+        _ => "This kind of attachment is not downloaded."
+    };
 
     /// <summary>
     /// Applies a provider status report to one of our messages.
@@ -345,7 +530,17 @@ public sealed class InboundProcessor(
         entity.ExternalMessageId,
         entity.DeliveryStatus.ToString(),
         entity.FailureReason,
-        entity.CreatedAtUtc);
+        entity.CreatedAtUtc,
+        entity.Attachments
+            .OrderBy(x => x.Id)
+            .Select(x => new MessageAttachmentResponse(
+                x.Id,
+                x.FileName,
+                x.ContentType,
+                x.SizeBytes,
+                x.Availability.ToString(),
+                x.UnavailableReason))
+            .ToList());
 
     /// <summary>
     /// Turns the channel's timestamp into a trustworthy UTC instant: local or unspecified kinds are

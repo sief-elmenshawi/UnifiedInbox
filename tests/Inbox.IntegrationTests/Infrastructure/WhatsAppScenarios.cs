@@ -92,6 +92,11 @@ internal static class WhatsAppScenarios
     [
         "wamid.HBgLMTY1MDM4NDA1NTU2NDIzNDgwMAkFVBQ",  // the text message fixture
         "wamid.HBgLMTY1MDM4NDA1NTU2NDEyMzQ1MAkFVBQ",  // the image message fixture
+        "wamid.HBgLMTY1MDM4NDA1NTU2NEFGRkQ1MAkFVBQ",  // the document message fixture
+        "wamid.HBgLMTY1MDM4NDA1NTU2NEZPV0ZDTgA",      // the audio message fixture
+        "wamid.HBgLMTY1MDM4NDA1NTU2NEZBQkJCQUNCR0E",  // the video message fixture
+        "wamid.HBgLMTY1MDM4NDA1NTU2NECFcUlNUVA",      // the sticker message fixture
+        "wamid.HBgLMTY1MDM4NDA1NTU2NERkxQ0lTRQ",      // the location message fixture
         "wamid.HBgLMTY1MDM4NDU5ODc2NTQzMjEwMA"       // every status fixture
     ];
 

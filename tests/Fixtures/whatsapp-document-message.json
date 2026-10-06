@@ -1,0 +1,41 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "96550000000",
+              "phone_number_id": "PHONE_NUMBER_ID"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Nadia" },
+                "wa_id": "96550001111"
+              }
+            ],
+            "messages": [
+              {
+                "from": "96550001111",
+                "id": "wamid.HBgLMTY1MDM4NDA1NTU2NEFGRkQ1MAkFVBQ",
+                "timestamp": "1730000100",
+                "type": "document",
+                "document": {
+                  "caption": "the invoice",
+                  "filename": "invoice-2026-03.pdf",
+                  "mime_type": "application/pdf",
+                  "sha256": "0Fh8ZgW1qVxLpT3nB6cYdKeR9uJmA4sX7wP2oL5iU8hG3fD1jK6nQ0rV9tY2bC4eS7aM1p",
+                  "id": "media-document-1"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

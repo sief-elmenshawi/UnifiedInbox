@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Inbox.Application.Channels;
+using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
 using Microsoft.Extensions.Logging;
@@ -121,5 +122,24 @@ public sealed class TestChannelAdapter(ILogger<TestChannelAdapter> logger) : ICh
             : $"{template.Name}: {string.Join(", ", template.BodyParameters)}";
 
         return SendTextAsync(channel, recipientExternalId, rendered, cancellationToken);
+    }
+
+    /// <summary>
+    /// There is no provider hosting anything for a Test channel, so there is nothing to download.
+    /// Reported as a failure rather than an empty success, because a caller that asked for bytes and got
+    /// none must not go on to record an attachment that cannot be opened.
+    /// </summary>
+    public Task<Result<DownloadedMedia>> DownloadMediaAsync(
+        Channel channel,
+        InboundMedia media,
+        long maxBytes,
+        CancellationToken cancellationToken = default)
+    {
+        logger.LogWarning(
+            "The test channel cannot serve media {MediaId}: there is no provider behind it.",
+            media.MediaId);
+
+        return Task.FromResult(Result.Failure<DownloadedMedia>(
+            Error.Failure(MediaDownloadErrors.Unavailable, "The test channel has no media to download.")));
     }
 }

@@ -1,9 +1,11 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Inbox.Application.Channels;
 using Inbox.Application.Options;
+using Inbox.Domain.Common;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -156,6 +158,264 @@ public sealed class WhatsAppGraphClient(
 
     private string MessagesPath(string phoneNumberId) =>
         $"{_options.GraphBaseUrl.TrimEnd('/')}/{_options.VersionSegment}/{phoneNumberId}/messages";
+
+    /// <summary>
+    /// Downloads the bytes behind a media id.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two calls, not one, and the order matters. <c>GET /{media_id}</c> returns a short-lived download
+    /// URL - valid for five minutes - and Meta refuses to serve the file from that URL unless the same
+    /// access token is presented, so a plain GET of it fails. Both requests therefore carry the bearer
+    /// token and both go through this client.
+    /// </para>
+    /// <para>
+    /// This is the reason media is fetched while the webhook is being processed rather than later: the
+    /// id itself only stays resolvable for about a week, and the URL for five minutes.
+    /// </para>
+    /// <para>
+    /// The bytes are capped at <paramref name="maxBytes"/>. Meta reports a size we cross-check, but the
+    /// cap is what actually stops a large response from being buffered, so it is enforced while reading
+    /// rather than after.
+    /// </para>
+    /// </remarks>
+    public async Task<Result<DownloadedMedia>> DownloadMediaAsync(
+        string phoneNumberId,
+        string accessToken,
+        InboundMedia media,
+        long maxBytes,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_options.GraphApiVersion))
+        {
+            return Result.Failure<DownloadedMedia>(
+                Error.Failure(MediaDownloadErrors.NotConfigured, "Meta:GraphApiVersion is not configured, so the media cannot be fetched."));
+        }
+
+        var referencePath =
+            $"{_options.GraphBaseUrl.TrimEnd('/')}/{_options.VersionSegment}/{Uri.EscapeDataString(media.MediaId)}";
+
+        string body;
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, referencePath);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            using var response = await http.SendAsync(request, cancellationToken);
+            body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                // 404 is the common one and is usually temporary: the id is not resolvable yet, or the
+                // media belongs to a phone number that is not ours. Both are worth another attempt.
+                logger.LogWarning(
+                    "Could not resolve WhatsApp media {MediaId}: the API returned {StatusCode}.",
+                    media.MediaId,
+                    (int)response.StatusCode);
+
+                return Result.Failure<DownloadedMedia>(
+                    Error.Failure(MediaDownloadErrors.Unavailable, $"WhatsApp could not resolve the media ({response.StatusCode})."));
+            }
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        {
+            logger.LogWarning(exception, "Could not reach the WhatsApp API to resolve a media reference.");
+
+            return Result.Failure<DownloadedMedia>(
+                Error.Failure(MediaDownloadErrors.ProviderUnreachable, "The WhatsApp API could not be reached."));
+        }
+
+        if (!TryReadDownloadUrl(body, out var downloadUrl, out var declaredContentType, out var sha256, out var fileSize))
+        {
+            return Result.Failure<DownloadedMedia>(
+                Error.Failure(MediaDownloadErrors.Unavailable, "WhatsApp returned no download URL for the media."));
+        }
+
+        // The provider has already told us how big this is, so a file over the ceiling costs one
+        // request instead of a transfer. The capped read below still enforces it, because a size that
+        // is absent, wrong or shrunk after the fact would otherwise slip through.
+        if (fileSize > maxBytes)
+        {
+            logger.LogInformation(
+                "WhatsApp media {MediaId} is {FileSize} bytes, over this deployment's {Limit}-byte ceiling.",
+                media.MediaId,
+                fileSize.Value,
+                maxBytes);
+
+            return Result.Failure<DownloadedMedia>(
+                Error.Failure(
+                    MediaDownloadErrors.TooLarge,
+                    $"The file is {fileSize.Value} bytes, which is over the {maxBytes}-byte limit this deployment accepts."));
+        }
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, downloadUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogWarning(
+                    "Could not download WhatsApp media {MediaId}: the CDN returned {StatusCode}.",
+                    media.MediaId,
+                    (int)response.StatusCode);
+
+                return Result.Failure<DownloadedMedia>(
+                    Error.Failure(MediaDownloadErrors.Unavailable, $"The media download was refused ({response.StatusCode})."));
+            }
+
+            var content = await ReadCappedAsync(response, maxBytes, cancellationToken);
+
+            if (content is null)
+            {
+                return Result.Failure<DownloadedMedia>(
+                    Error.Failure(
+                        MediaDownloadErrors.TooLarge,
+                        $"The file is over the {maxBytes}-byte limit this deployment accepts."));
+            }
+
+            // Cross-checked, not trusted: a mismatch means the transfer was truncated or altered, and the
+            // caller stores the bytes only after the storage layer has sniffed them.
+            var effectiveSha = string.IsNullOrWhiteSpace(sha256) ? media.Sha256 : sha256;
+
+            if (!string.IsNullOrWhiteSpace(effectiveSha) && !Matches(effectiveSha, content))
+            {
+                logger.LogWarning(
+                    "WhatsApp media {MediaId} did not match the digest the provider advertised.",
+                    media.MediaId);
+
+                return Result.Failure<DownloadedMedia>(
+                    Error.Failure(MediaDownloadErrors.Corrupt, "The downloaded media did not match its advertised digest."));
+            }
+
+            return Result.Success(new DownloadedMedia(
+                content,
+                declaredContentType ?? media.DeclaredContentType,
+                effectiveSha));
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        {
+            logger.LogWarning(exception, "Could not download WhatsApp media {MediaId}.", media.MediaId);
+
+            return Result.Failure<DownloadedMedia>(
+                Error.Failure(MediaDownloadErrors.ProviderUnreachable, "The media could not be downloaded."));
+        }
+    }
+
+    /// <summary>
+    /// Reads a response body, refusing to buffer more than <paramref name="maxBytes"/>. Returns null when
+    /// the stream is over the cap, so an oversized file is never held in memory in full.
+    /// </summary>
+    private static async Task<byte[]?> ReadCappedAsync(HttpResponseMessage response, long maxBytes, CancellationToken cancellationToken)
+    {
+        var declaredLength = response.Content.Headers.ContentLength;
+
+        if (declaredLength is > 0 && declaredLength > maxBytes)
+        {
+            return null;
+        }
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+
+        using var buffer = new MemoryStream();
+
+        var chunk = new byte[81920];
+
+        while (true)
+        {
+            var read = await stream.ReadAsync(chunk, cancellationToken);
+
+            if (read <= 0)
+            {
+                break;
+            }
+
+            if (buffer.Length + read > maxBytes)
+            {
+                return null;
+            }
+
+            await buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken);
+        }
+
+        return buffer.Length == 0 ? null : buffer.ToArray();
+    }
+
+    /// <summary>
+    /// Compares downloaded bytes against the digest the provider advertised. Meta publishes sha256 as hex;
+    /// a base64 digest is accepted too, because that is the other form the value travels in.
+    /// </summary>
+    private static bool Matches(string expectedSha256, byte[] content)
+    {
+        var actual = Convert.ToHexString(SHA256.HashData(content));
+
+        if (expectedSha256.Length == 64 && expectedSha256.All(Uri.IsHexDigit))
+        {
+            return string.Equals(actual, expectedSha256, StringComparison.OrdinalIgnoreCase);
+        }
+
+        try
+        {
+            return CryptographicOperations.FixedTimeEquals(
+                SHA256.HashData(content),
+                Convert.FromBase64String(expectedSha256));
+        }
+        catch (FormatException)
+        {
+            // A digest in neither form is not something to assert on. The bytes are still validated by
+            // signature before they are stored, so refusing here would only cause a spurious retry.
+            return true;
+        }
+    }
+
+    private static bool TryReadDownloadUrl(
+        string body,
+        out string url,
+        out string? contentType,
+        out string? sha256,
+        out long? fileSize)
+    {
+        url = string.Empty;
+        contentType = null;
+        sha256 = null;
+        fileSize = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            url = Text(document.RootElement, "url") ?? string.Empty;
+            contentType = Text(document.RootElement, "mime_type");
+            sha256 = Text(document.RootElement, "sha256");
+            fileSize = Number(document.RootElement, "file_size");
+
+            return Uri.TryCreate(url, UriKind.Absolute, out _);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static long? Number(JsonElement element, string property) =>
+        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var parsed)
+            ? parsed
+            : null;
+
+    private static string? Text(JsonElement element, string property) =>
+        element.ValueKind == JsonValueKind.Object
+        && element.TryGetProperty(property, out var value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     /// <summary>Reads <c>messages[0].id</c> from a send response.</summary>
     private static string? ReadMessageId(string body)

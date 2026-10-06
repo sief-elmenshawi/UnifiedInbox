@@ -24,8 +24,11 @@ public sealed class WhatsAppWebhookParser(TimeProvider clock, ILogger<WhatsAppWe
         ["image"] = MessageType.Image,
         ["audio"] = MessageType.Audio,
         ["video"] = MessageType.Video,
-        ["document"] = MessageType.Document,
-        ["sticker"] = MessageType.Image
+["document"] = MessageType.Document,
+
+        // A sticker is reported as its own kind rather than folded into images: we never download one,
+        // so keeping it distinct is what stops a WebP sticker being fetched and then rejected on arrival.
+        ["sticker"] = MessageType.Sticker
     };
 
     /// <summary>
@@ -138,8 +141,8 @@ public sealed class WhatsAppWebhookParser(TimeProvider clock, ILogger<WhatsAppWe
                 continue;
             }
 
-            var type = Text(message, "type") ?? "unsupported";
-            var (messageType, body) = ReadContent(message, type);
+var type = Text(message, "type") ?? "unsupported";
+            var (messageType, body, media) = ReadContent(message, type);
 
             events.Add(new InboundEvent(
                 ChannelType.WhatsApp,
@@ -150,7 +153,10 @@ public sealed class WhatsAppWebhookParser(TimeProvider clock, ILogger<WhatsAppWe
                 body,
                 messageType,
                 ReadTimestamp(message),
-                InboundEventKind.Message));
+                InboundEventKind.Message,
+                Status: null,
+                StatusDetail: null,
+                Media: media));
         }
     }
 
@@ -247,36 +253,70 @@ public sealed class WhatsAppWebhookParser(TimeProvider clock, ILogger<WhatsAppWe
         return names;
     }
 
-    /// <summary>
-    /// Extracts the text of one message. Media has no text of its own, so it is labelled - a
-    /// conversation preview of an empty string would look like nothing arrived.
+/// <summary>
+    /// Extracts one message's content. Media carries no text of its own, so it is labelled - a preview
+    /// of an empty string would look like nothing arrived.
     /// </summary>
-    private static (MessageType Type, string? Body) ReadContent(JsonElement message, string type)
+    /// <remarks>
+    /// A media id, mime type and digest are captured whenever the payload has them, for every media kind
+    /// including the ones we do not download. Whether a file is fetched is a storage decision made later;
+    /// losing the reference here would make that impossible, because the payload is not kept.
+    /// </remarks>
+    private static (MessageType Type, string? Body, InboundMedia? Media) ReadContent(JsonElement message, string type)
     {
         if (string.Equals(type, "text", StringComparison.OrdinalIgnoreCase))
         {
-            return (MessageType.Text, TryGet(message, "text", out var text) ? Text(text, "body") : null);
+            return (MessageType.Text, TryGet(message, "text", out var text) ? Text(text, "body") : null, null);
         }
 
         if (MediaTypes.TryGetValue(type, out var mediaType))
         {
-            // A caption is the only text a media message can carry; the filename is the next best
-            // thing to show when there is none.
-            var caption = TryGet(message, type, out var media) ? Text(media, "caption") : null;
-            var fileName = string.Equals(type, "document", StringComparison.OrdinalIgnoreCase)
-                && TryGet(message, type, out var document)
-                    ? Text(document, "filename")
-                    : null;
+            var hasMediaObject = TryGet(message, type, out var media);
 
-            var body = caption ?? (fileName is null ? $"[{type}]" : $"[{type}: {fileName}]");
+            // A caption is the only text a media message can carry; the filename is the next best thing
+            // to show for a document when there is none.
+            var caption = hasMediaObject ? Text(media, "caption") : null;
+            var fileName = hasMediaObject
+                           && string.Equals(type, "document", StringComparison.OrdinalIgnoreCase)
+                ? Text(media, "filename")
+                : null;
 
-            return (mediaType, body);
+            var body = caption ?? Placeholder(type, fileName);
+
+            return (mediaType, body, ReadMedia(hasMediaObject ? media : default, fileName));
         }
 
-        // button, interactive, location, order, contacts, reaction, sticker-like unknowns and system
-        // notices: recorded so the thread stays complete, but not rendered as something it is not.
-        return (MessageType.Unsupported, $"[{type}]");
+        // button, interactive, location, order, contacts, reaction and system notices: recorded so the
+        // thread stays complete, but not rendered as something it is not.
+        return (MessageType.Unsupported, Placeholder(type, fileName: null), null);
     }
+
+    /// <summary>
+    /// The reference to a provider-hosted file, or null when the payload carried no media object - which
+    /// happens when a delivery is reported but the file is not actually offered to us.
+    /// </summary>
+    private static InboundMedia? ReadMedia(JsonElement media, string? fileName)
+    {
+        if (media.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var id = Text(media, "id");
+
+        return string.IsNullOrWhiteSpace(id)
+            ? null
+            : new InboundMedia(id, Text(media, "mime_type"), Text(media, "sha256"), fileName, Number(media, "file_size"));
+    }
+
+    /// <summary>
+    /// Text shown for something we have no text for. Says what it is rather than saying nothing, because
+    /// an agent looking at an empty bubble cannot tell a customer sent a photo from a broken record.
+    /// </summary>
+    private static string Placeholder(string type, string? fileName) =>
+        string.Equals(type, "document", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(fileName)
+            ? $"[document: {fileName}]"
+            : $"[{type}]";
 
     /// <summary>
     /// Meta sends epoch seconds as a string. A missing or nonsensical timestamp falls back to

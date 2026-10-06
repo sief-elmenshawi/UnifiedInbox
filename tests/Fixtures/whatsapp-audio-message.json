@@ -1,0 +1,39 @@
+{
+  "object": "whatsapp_business_account",
+  "entry": [
+    {
+      "id": "102290129340398",
+      "changes": [
+        {
+          "field": "messages",
+          "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {
+              "display_phone_number": "96550000000",
+              "phone_number_id": "PHONE_NUMBER_ID"
+            },
+            "contacts": [
+              {
+                "profile": { "name": "Nadia" },
+                "wa_id": "96550001111"
+              }
+            ],
+            "messages": [
+              {
+                "from": "96550001111",
+                "id": "wamid.HBgLMTY1MDM4NDA1NTU2NEZPV0ZDTgA",
+                "timestamp": "1730000100",
+                "type": "audio",
+                "audio": {
+                  "mime_type": "audio/ogg; codecs=opus",
+                  "sha256": "7dR3pQ9vX2mK8sT1yB5nL4wE6gH0jA2cF9dU7uI3oP5rT1zX8vB2mK6sN4wE9gH0",
+                  "id": "media-voice-note-1"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

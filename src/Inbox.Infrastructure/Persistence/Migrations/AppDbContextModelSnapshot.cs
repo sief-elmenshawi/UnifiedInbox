@@ -439,6 +439,11 @@ namespace Inbox.Infrastructure.Persistence.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uniqueidentifier");
 
+                    b.Property<string>("Availability")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
                     b.Property<string>("ContentType")
                         .IsRequired()
                         .HasMaxLength(128)
@@ -461,6 +466,10 @@ namespace Inbox.Infrastructure.Persistence.Migrations
 
                     b.Property<string>("StoragePath")
                         .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("nvarchar(512)");
+
+                    b.Property<string>("UnavailableReason")
                         .HasMaxLength(512)
                         .HasColumnType("nvarchar(512)");
 

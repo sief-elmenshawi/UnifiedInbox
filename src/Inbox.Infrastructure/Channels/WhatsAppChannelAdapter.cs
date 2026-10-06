@@ -1,4 +1,5 @@
 using Inbox.Application.Channels;
+using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
 using Inbox.Infrastructure.Channels.WhatsApp;
@@ -66,6 +67,30 @@ public sealed class WhatsAppChannelAdapter(
                 recipientExternalId,
                 template,
                 cancellationToken);
+    }
+
+    public Task<Result<DownloadedMedia>> DownloadMediaAsync(
+        Channel channel,
+        InboundMedia media,
+        long maxBytes,
+        CancellationToken cancellationToken = default)
+    {
+        var accessToken = RequireAccessToken(channel);
+
+        if (accessToken is null)
+        {
+            // Not retryable in any useful sense: a channel with no token will still have none in thirty
+            // seconds. Recorded as a failure so the outbox can decide, rather than thrown.
+            return Task.FromResult(Result.Failure<DownloadedMedia>(
+                Error.Failure(MediaDownloadErrors.NoAccessToken, "The channel has no WhatsApp access token configured.")));
+        }
+
+        return graph.DownloadMediaAsync(
+            channel.ExternalAccountId,
+            accessToken,
+            media,
+            maxBytes,
+            cancellationToken);
     }
 
     private string? RequireAccessToken(Channel channel)

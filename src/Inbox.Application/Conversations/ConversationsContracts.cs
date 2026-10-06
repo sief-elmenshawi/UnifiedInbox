@@ -74,7 +74,32 @@ public sealed record ConversationMessageResponse(
     string? ExternalMessageId,
     string DeliveryStatus,
     string? FailureReason,
-    DateTime CreatedAtUtc);
+    DateTime CreatedAtUtc,
+    IReadOnlyList<MessageAttachmentResponse> Attachments);
+
+/// <summary>
+/// A file on a message, as the thread renders it.
+/// </summary>
+/// <remarks>
+/// <para>
+/// There is no path here, and nothing a client could turn into one: the file is fetched by id from
+/// <c>GET /api/attachments/{id}</c>. That endpoint also refuses anything that is not
+/// <see cref="AttachmentAvailability.Available"/>, so a stale page cannot download a file we
+/// deliberately did not keep.
+/// </para>
+/// <para>
+/// <paramref name="Availability"/> and <paramref name="UnavailableReason"/> are present on every
+/// attachment, not only the broken ones, so the client can render "file not kept: too large" without a
+/// second request.
+/// </para>
+/// </remarks>
+public sealed record MessageAttachmentResponse(
+    Guid Id,
+    string FileName,
+    string ContentType,
+    long SizeBytes,
+    string Availability,
+    string? UnavailableReason);
 
 public sealed record SendMessageRequest(string Text);
 

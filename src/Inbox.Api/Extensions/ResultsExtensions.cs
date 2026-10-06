@@ -14,6 +14,7 @@ public static class ResultsExtensions
     {
         ErrorType.Validation => StatusCodes.Status422UnprocessableEntity,
         ErrorType.NotFound => StatusCodes.Status404NotFound,
+        ErrorType.Gone => StatusCodes.Status410Gone,
         ErrorType.Conflict => StatusCodes.Status409Conflict,
         ErrorType.Unauthorized => StatusCodes.Status401Unauthorized,
         ErrorType.Forbidden => StatusCodes.Status403Forbidden,
@@ -31,6 +32,7 @@ public static class ResultsExtensions
             {
                 ErrorType.Validation => "Validation failed",
                 ErrorType.NotFound => "Not found",
+                ErrorType.Gone => "Gone",
                 ErrorType.Conflict => "Conflict",
                 ErrorType.Unauthorized => "Unauthorized",
                 ErrorType.Forbidden => "Forbidden",
