@@ -55,8 +55,32 @@
     "WebhookPermitLimit": 600,
     "WebhookWindowSeconds": 60
   },
-  "Storage": {
-    "RootPath": "storage"
+  "_commentMedia": "Media:RootPath must resolve OUTSIDE the web/content root - the app refuses to start if it does not. '../../media' resolves to <repo>/media, which is gitignored; in production use an absolute path on a separate volume. The size ceilings are Meta's published Cloud API limits (image 5MB, audio 16MB, document 100MB, media-api reference v23.0) and are configuration only so they can be tightened per deployment or moved when Meta changes them. AllowedContentTypes are matched against the type detected from the file's magic bytes, never against what Meta or the browser declared. Voice notes arrive as 'audio/ogg; codecs=opus', so parameters are stripped before matching.",
+  "Media": {
+    "RootPath": "../../media",
+    "MaxFileSizeBytes": 104857600,
+    "DownloadInboundMedia": true,
+    "Images": {
+      "MaxSizeBytes": 5242880,
+      "AllowedContentTypes": [ "image/jpeg", "image/png" ]
+    },
+    "Documents": {
+      "MaxSizeBytes": 104857600,
+      "AllowedContentTypes": [
+        "application/pdf",
+        "text/plain",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      ]
+    },
+    "Audio": {
+      "MaxSizeBytes": 16777216,
+      "AllowedContentTypes": [ "audio/aac", "audio/amr", "audio/mpeg", "audio/mp4", "audio/ogg" ]
+    }
   },
   "Swagger": {
     "Enabled": true

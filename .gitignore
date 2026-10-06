@@ -488,3 +488,8 @@ secrets.json
 *.user
 .env
 
+# Customer attachments (passports, tickets, receipts). Never committed: the dev default is
+# <repo>/media via Media:RootPath, and production points this at a volume outside the deploy.
+/media/
+/storage/
+

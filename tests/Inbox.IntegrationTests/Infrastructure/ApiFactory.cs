@@ -35,6 +35,14 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     internal const string Issuer = "inbox-integration-tests";
     internal const string Audience = "inbox-integration-tests-api";
 
+    /// <summary>
+    /// Where attachment bytes go for the tests. A real directory outside the content root, because the
+    /// application refuses to start otherwise - which is the behaviour the media tests rely on, so the
+    /// suite must live with it rather than switch it off.
+    /// </summary>
+    internal string MediaRootPath { get; } =
+        Path.Combine(Path.GetTempPath(), "inbox-integration-media", Guid.NewGuid().ToString("N"));
+
     private static readonly string[] OverriddenVariables =
     [
         "ConnectionStrings__Default",
@@ -52,8 +60,11 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
         "RateLimiting__RefreshPermitLimit",
         "RateLimiting__WebhookAcceptedPermitLimit",
         "RateLimiting__WebhookFailurePermitLimit",
-        "Meta__GraphApiVersion",
+"Meta__GraphApiVersion",
         "Meta__GraphBaseUrl",
+        "Media__RootPath",
+        "Media__MaxFileSizeBytes",
+        "Media__DownloadInboundMedia",
         "Serilog__MinimumLevel__Default",
         "Serilog__WriteTo__1__Name",
         "Serilog__WriteTo__1__Args__path"
@@ -157,8 +168,12 @@ var builder = new StringBuilder();
 
         // The graph host is stubbed, but the version is not optional: the client refuses to build a
         // URL without it, and a send has to look configured for the send tests to mean anything.
-        Set("Meta__GraphApiVersion", "v21.0");
+Set("Meta__GraphApiVersion", "v21.0");
         Set("Meta__GraphBaseUrl", "https://graph.facebook.com");
+
+        // Attachments. The root is a real directory because the application validates on start that it
+        // resolves outside the web root, and a test suite is not exempt from that rule.
+        Set("Media__RootPath", MediaRootPath);
         // Information so that a *successful* request is logged, not only a failing one. The token tests
         // need a hub line they can rely on being there, and Serilog only writes 2xx requests at Information.
         Set("Serilog__MinimumLevel__Default", "Information");
@@ -228,7 +243,29 @@ var builder = new StringBuilder();
             Environment.SetEnvironmentVariable(name, null);
         }
 
-        await _container.DisposeAsync();
+await _container.DisposeAsync();
+
+        // The attachment bytes the tests caused to be written, removed with the run that wrote them.
+        TryDeleteDirectory(MediaRootPath);
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch (IOException)
+        {
+            // A file still held open by a worker that is winding down. It lives in temp and is named
+            // after this run, so leaving it costs a directory, not a leak of anything identifiable.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static void Set(string name, string value) =>

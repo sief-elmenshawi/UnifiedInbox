@@ -4,6 +4,7 @@ using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
 using Inbox.Application.Inbound;
+using Inbox.Application.Media;
 using Inbox.Application.Options;
 using Inbox.Infrastructure.Agents;
 using Inbox.Infrastructure.Channels;
@@ -11,6 +12,7 @@ using Inbox.Infrastructure.Channels.WhatsApp;
 using Inbox.Infrastructure.Conversations;
 using Inbox.Infrastructure.Identity;
 using Inbox.Infrastructure.Inbound;
+using Inbox.Infrastructure.Media;
 using Inbox.Infrastructure.Persistence;
 using Inbox.Infrastructure.Seeding;
 using Inbox.Infrastructure.Tenancy;
@@ -140,6 +142,24 @@ public static class DependencyInjection
                 "Inbound:FailedRetentionDays must be at least Inbound:ProcessedRetentionDays, because a " +
                 "delivery that failed is the one an operator still has to act on.")
             .ValidateOnStart();
+
+        // Media limits and the storage root are configuration because Meta versions its limits and a
+        // deployment may need to be stricter. Validated on start: a bad whitelist or an unset root
+        // discovered on the first customer upload would mean a message recorded with no file.
+        services.AddOptions<MediaOptions>()
+            .Bind(configuration.GetSection(MediaOptions.SectionName))
+            .ValidateDataAnnotations()
+            .Validate(
+                options => !options.DownloadInboundMedia || !string.IsNullOrWhiteSpace(options.RootPath),
+                "Media:RootPath is required when Media:DownloadInboundMedia is on, because there would be " +
+                "nowhere to put a file the provider has already offered us.")
+            .Validate(
+                options => !options.DownloadInboundMedia || options.Images.AllowedContentTypes.Length > 0,
+                "Media:Images:AllowedContentTypes cannot be empty while Media:DownloadInboundMedia is on: " +
+                "it would reject every image a customer sends.")
+            .ValidateOnStart();
+
+        services.AddSingleton<IMediaStorage, MediaStorage>();
 
         // The WhatsApp Cloud API. The Graph version is configuration (Meta versions it), and sending
         // without one fails with a message naming the setting instead of a confusing 404 - which
