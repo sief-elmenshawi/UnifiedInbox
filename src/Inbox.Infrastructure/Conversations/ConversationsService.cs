@@ -263,7 +263,7 @@ public sealed class ConversationsService(
         return await BuildDetailAsync(conversationId, cancellationToken);
     }
 
-    public async Task<Result<ConversationDetailResponse>> TransferAsync(
+public async Task<Result<ConversationDetailResponse>> TransferAsync(
         Guid agentId,
         Guid conversationId,
         Guid targetAgentId,
@@ -281,17 +281,8 @@ public sealed class ConversationsService(
             return Result.Failure<ConversationDetailResponse>(AlreadyResolved());
         }
 
-        if (!conversation.AssignedAgentId.HasValue)
-        {
-            return Result.Failure<ConversationDetailResponse>(
-                Error.Conflict(ConversationErrors.NotAssigned, "Take the conversation before transferring it."));
-        }
-
-        if (!await MayManageAsync(conversation, agentId, cancellationToken))
-        {
-            return Result.Failure<ConversationDetailResponse>(NotAssignedToYou());
-        }
-
+        // The target is validated before the assignment state is looked at, so an admin assigning an
+        // unassigned thread is refused for a bad target in exactly the same words as anybody else.
         var target = await userManager.FindByIdAsync(targetAgentId.ToString());
 
         if (target is null)
@@ -309,6 +300,63 @@ public sealed class ConversationsService(
         if (conversation.IsAssignedTo(targetAgentId))
         {
             return await BuildDetailAsync(conversationId, cancellationToken);
+        }
+
+        // Nobody owns the thread, so there is nothing to hand over and nobody to take it from. Assigning
+        // it is a different act from transferring it, so it says so in the history - but only an admin
+        // gets to decide who picks up the queue, because that is a distribution decision rather than
+        // something an agent should be able to hand themselves. A regular agent claiming an unassigned
+        // thread uses Take, which is the same write with Take's rules.
+        if (!conversation.AssignedAgentId.HasValue)
+        {
+            if (!await IsAdminAsync(agentId, cancellationToken))
+            {
+                return Result.Failure<ConversationDetailResponse>(
+                    Error.Conflict(ConversationErrors.NotAssigned, "Take the conversation before transferring it."));
+            }
+
+            // Checked and set in one statement rather than trusting the read above. An optimistic token
+            // only catches writes that genuinely overlap; this one did not - the agent's take committed
+            // first, so this request re-read an assigned thread and would have quietly turned an
+            // allocation into a transfer, recording "Transferred" off an owner the admin never saw. The
+            // condition is the decision: whoever gets the row gets the thread, and the other is told it
+            // is gone rather than handed a second, contradictory event.
+            await using var assignment = await db.Database.BeginTransactionAsync(cancellationToken);
+
+            var taken = await db.Conversations
+                .Where(x => x.Id == conversationId && x.AssignedAgentId == null && x.Status == ConversationStatus.Open)
+                .ExecuteUpdateAsync(
+                    setters => setters.SetProperty(x => x.AssignedAgentId, targetAgentId),
+                    cancellationToken);
+
+            if (taken == 0)
+            {
+                // Disposing an uncommitted transaction rolls it back, so nothing was half-assigned.
+                return Result.Failure<ConversationDetailResponse>(await AlreadyTakenAsync(conversationId, cancellationToken));
+            }
+
+            // The assignment and the record of it commit together. The entity tracked above is left
+            // untouched on purpose: it still holds the state this request read, and updating it now would
+            // be a second write against a RowVersion that has already moved on.
+            db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Assigned, agentId, targetAgentId));
+
+            await db.SaveChangesAsync(cancellationToken);
+            await assignment.CommitAsync(cancellationToken);
+
+            logger.LogInformation(
+                "Conversation {ConversationId} assigned by admin {ActorId} to agent {TargetId}.",
+                conversationId,
+                agentId,
+                targetAgentId);
+
+            await AnnounceAsync(conversationId, targetAgentId, cancellationToken);
+
+            return await BuildDetailAsync(conversationId, cancellationToken);
+        }
+
+        if (!await MayManageAsync(conversation, agentId, cancellationToken))
+        {
+            return Result.Failure<ConversationDetailResponse>(NotAssignedToYou());
         }
 
         conversation.Assign(targetAgentId);
@@ -929,6 +977,16 @@ public sealed class ConversationsService(
             .AsNoTracking()
             .AnyAsync(x => x.Id == agentId && x.Role == AgentRole.Admin, cancellationToken);
     }
+
+    /// <summary>
+    /// Whether the caller may distribute unassigned work. An agent who wants a thread takes it, which is
+    /// a claim rather than an allocation, so the two are kept apart: the check is not "may manage this
+    /// conversation" because there is no owner whose permission could grant it.
+    /// </summary>
+    private Task<bool> IsAdminAsync(Guid agentId, CancellationToken cancellationToken) =>
+        db.Agents
+            .AsNoTracking()
+            .AnyAsync(x => x.Id == agentId && x.Role == AgentRole.Admin, cancellationToken);
 
     private ConversationEvent Event(
         Guid conversationId,

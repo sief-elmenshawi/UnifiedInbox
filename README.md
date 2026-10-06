@@ -84,7 +84,7 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `GET` | `/api/conversations?filter=all\|unassigned\|mine\|resolved` | Agent list, cursor paginated, `search` matches name and preview. |
 | `GET` | `/api/conversations/{id}` | Conversation plus its event history. |
 | `GET` | `/api/conversations/{id}/messages?pageSize=50&before={messageId}` | Newest first. |
-| `POST` | `/api/conversations/{id}/take\|release\|transfer\|resolve\|reopen\|read` | `transfer` body: `{"targetAgentId":"…"}`. |
+| `POST` | `/api/conversations/{id}/take\|release\|transfer\|resolve\|reopen\|read` | `transfer` body: `{"targetAgentId":"…"}`. Admin only when the thread is unassigned — that records an `Assigned` event, not a `Transferred` one. |
 | `POST` | `/api/conversations/{id}/messages` | Body `{"text":"…"}`; only inside the 24-hour reply window. |
 | `POST` | `/api/conversations/{id}/template-messages` | Body `{"name":"follow_up_quote","languageCode":"en_US","bodyParameters":["Amir"]}`; allowed even when the 24-hour window is closed. |
 | `GET` | `/api/channels` | Admin only. Secrets are never returned, only whether they are set. |
@@ -140,8 +140,9 @@ GET /api/webhooks/whatsapp?hub.mode=subscribe&hub.verify_token=…&hub.challenge
 by Meta's own signature instead: `X-Hub-Signature-256` is `sha256=` plus the HMAC-SHA256 of the raw
 body keyed with the channel's app secret. The body is read as raw text and never re-serialised, because
 that would change the bytes and break the check. A payload that fails verification is refused with
-`401`; one for an unknown or disconnected channel is acknowledged with `200` and dropped, because
-retrying could not make it attributable.
+`401`; one that cannot be attributed — no `metadata.phone_number_id`, an unknown number, or a
+disconnected channel — is acknowledged with `200`, logged, and dropped, because retrying could not make
+it attributable. The only other non-2xx answer is `429` when a caller has spent its budget.
 
 Responses are `200` as soon as the verified raw payload is durably appended to the `WebhookEvents`
 outbox table. Meta retries anything slower, and a retry storm is worse than the work. The background
@@ -260,11 +261,11 @@ tests/Fixtures            recorded WhatsApp webhook payloads, shared by both tes
 | `401` with `auth.account_locked` | 5 wrong passwords in a row locks the account for 15 minutes. An admin can reset the password. |
 | `404` on `/api/dev/simulate-inbound` | The dev endpoints are only mapped in Development; outside it the route does not exist. |
 | `409` with `conversation.already_taken` | Another agent owns the conversation. Use `transfer` (owner or admin) instead of stealing it. |
+| `409` with `conversation.not_assigned` on `transfer` | The thread has no owner and you are not an admin. Use `take` to claim it; only an admin can allocate an unassigned thread to somebody else. |
 | `422` with `conversation.window_closed` | The last inbound message is older than 24 hours. Send an approved template instead: `POST /api/conversations/{id}/template-messages`. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
 | `403` on `/api/channels` | Agents cannot manage channels; only an admin can connect or disconnect one. |
 | `401` on `/api/webhooks/whatsapp` | `X-Hub-Signature-256` is missing or does not match the raw body signed with the channel's app secret. A tunnel that rewrites the body would do the same thing. |
-| `400` on `/api/webhooks/whatsapp` | The payload has no `metadata.phone_number_id`, so nothing identifies the sender. |
-| WhatsApp deliveries arrive and are all dropped | The channel was disconnected, or its `externalAccountId` is not the phone number id from the Meta dashboard. Check the API log for the channel id. |
+| WhatsApp deliveries arrive and are all dropped | The channel was disconnected, or its `externalAccountId` is not the phone number id from the Meta dashboard. Check the API log for the channel id. Unattributable payloads (no `metadata.phone_number_id`, or an unknown number) are answered `200` and logged rather than refused, because Meta would otherwise repeat them for days without the outcome ever changing. |
 | A send is recorded as `Failed` with "GraphApiVersion is not configured" | `Meta:GraphApiVersion` is missing from configuration. |
 | Hub connects then immediately disconnects, or 401 with `access_token` | The token must be passed as `?access_token=` on `/hubs/inbox`; a query token is only accepted on that route. |
 | A thread event never arrives | Thread events only go to connections that called `OpenConversation` for that thread. Call it after the detail request succeeds, and again after switching threads. |

@@ -269,7 +269,7 @@ erDiagram
     CONVERSATION_EVENT {
         guid Id PK
         guid ConversationId FK
-        string Type "Created | Taken | Joined | Transferred | Resolved | Reopened"
+        string Type "Created | Taken | Joined | Assigned | Transferred | Released | Resolved | Reopened"
         guid ActorAgentId FK "nullable"
         guid TargetAgentId FK "nullable"
         datetime CreatedAtUtc

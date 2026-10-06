@@ -2,8 +2,12 @@ using System.Net;
 using FluentAssertions;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
+using Inbox.Application.Realtime;
 using Inbox.Infrastructure.Conversations;
+using Inbox.Infrastructure.Persistence;
 using Inbox.IntegrationTests.Infrastructure;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Inbox.IntegrationTests;
 
@@ -190,18 +194,201 @@ public sealed class ConversationWorkflowTests(ApiFactory factory)
     }
 
     [Fact]
-    public async Task Transferring_requires_the_conversation_to_be_taken_first()
+    public async Task Transferring_an_unassigned_conversation_is_for_admins_only()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
         var colleague = await AgentScenarios.CreateAsync(admin.Client);
-        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, "Salma Idris", "Hello");
+        var claimant = await AgentScenarios.CreateAsync(admin.Client);
+        var claimantSession = await ApiClient.LoginAsync(factory, claimant.Email, claimant.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, ConversationScenarios.UniqueName("Salma Idris"), "Hello");
 
-        var response = await admin.Client.PostAsync(
+        // An agent cannot allocate work to somebody else, and cannot hand over a thread it does not own:
+        // claiming one is what Take is for.
+        var byAgent = await claimantSession.Client.PostAsync(
             $"/api/conversations/{conversation.Id}/transfer",
             new TransferConversationRequest(colleague.Id));
 
-        response.StatusCode.Should().Be(HttpStatusCode.Conflict);
-        (await ApiClient.ReadProblemAsync(response)).ErrorCode.Should().Be(ConversationErrors.NotAssigned);
+        byAgent.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        (await ApiClient.ReadProblemAsync(byAgent)).ErrorCode.Should().Be(ConversationErrors.NotAssigned);
+
+        // The same request from an admin is the allocation it was refused for as an agent.
+        var assigned = await ConversationScenarios.ActionAsync(
+            admin.Client,
+            conversation.Id,
+            "transfer",
+            new TransferConversationRequest(colleague.Id));
+
+        assigned.AssignedAgentId.Should().Be(colleague.Id);
+        (await ConversationScenarios.OpenAsync(admin.Client, conversation.Id)).AssignedAgentId
+            .Should().Be(colleague.Id, "and it is still there when the thread is read again");
+    }
+
+    [Fact]
+    public async Task An_admin_assigning_an_unassigned_conversation_records_an_assignment_not_a_transfer()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var colleague = await AgentScenarios.CreateAsync(admin.Client);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, ConversationScenarios.UniqueName("Nour Zahra"), "Who has this?");
+
+        var assigned = await ConversationScenarios.ActionAsync(
+            admin.Client,
+            conversation.Id,
+            "transfer",
+            new TransferConversationRequest(colleague.Id));
+
+        // Assigned, and not Transferred: nothing was taken off anybody, and a history claiming this thread
+        // came from an owner it never had would misreport who was working on it. Nor is it a Taken, because
+        // nobody claimed it - the admin put it on somebody's desk.
+        assigned.Events.Should().ContainSingle(x => x.Type == "Assigned"
+            && x.ActorAgentId == admin.Tokens.Agent.Id
+            && x.TargetAgentId == colleague.Id);
+
+        assigned.Events.Should().NotContain(x => x.Type == "Transferred" || x.Type == "Taken");
+    }
+
+    [Fact]
+    public async Task Assigning_an_unassigned_conversation_announces_it_to_the_dashboard()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var colleague = await AgentScenarios.CreateAsync(admin.Client);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(
+            admin.Client, ConversationScenarios.UniqueName("Assign Broadcast"), "Assign me");
+
+        await using var tab = await HubScenarios.OpenTabAsync(factory, admin);
+
+        // Registered before the call that causes it.
+        var announced = tab.NextAsync<ConversationAssignmentEvent>(InboxEvents.ConversationAssigned);
+
+        (await ConversationScenarios.ActionAsync(
+                admin.Client,
+                conversation.Id,
+                "transfer",
+                new TransferConversationRequest(colleague.Id)))
+            .AssignedAgentId.Should().Be(colleague.Id);
+
+        var assignment = await announced;
+
+        assignment.ConversationId.Should().Be(conversation.Id);
+        assignment.AgentId.Should().Be(colleague.Id);
+    }
+
+    [Fact]
+    public async Task Assigning_an_unassigned_conversation_needs_an_active_agent_and_an_open_thread()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var deactivated = await AgentScenarios.CreateAsync(admin.Client);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(admin.Client, ConversationScenarios.UniqueName("Karim Nabil"), "Hello");
+
+        await AgentScenarios.DeactivateAsync(admin.Client, deactivated.Id);
+
+        var inactive = await admin.Client.PostAsync(
+            $"/api/conversations/{conversation.Id}/transfer",
+            new TransferConversationRequest(deactivated.Id));
+
+        inactive.StatusCode.Should().Be(HttpStatusCode.UnprocessableEntity);
+        (await ApiClient.ReadProblemAsync(inactive)).ErrorCode.Should().Be(ConversationErrors.AgentInactive);
+
+        // And the other way round: a resolved thread is not available work to allocate.
+        var resolver = await AgentScenarios.CreateAsync(admin.Client);
+        var resolverSession = await ApiClient.LoginAsync(factory, resolver.Email, resolver.TemporaryPassword);
+        await ConversationScenarios.ActionAsync(resolverSession.Client, conversation.Id, "take");
+        await ConversationScenarios.ActionAsync(resolverSession.Client, conversation.Id, "resolve");
+
+        var resolved = await admin.Client.PostAsync(
+            $"/api/conversations/{conversation.Id}/transfer",
+            new TransferConversationRequest(deactivated.Id));
+
+        resolved.StatusCode.Should().Be(HttpStatusCode.Conflict);
+        (await ApiClient.ReadProblemAsync(resolved)).ErrorCode.Should().Be(ConversationErrors.AlreadyResolved);
+    }
+
+    [Fact]
+    public async Task Pulling_an_unassigned_thread_at_the_same_time_ends_with_one_owner_and_a_history_that_agrees()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var colleague = await AgentScenarios.CreateAsync(admin.Client);
+        var claimant = await AgentScenarios.CreateAsync(admin.Client);
+        var claimantSession = await ApiClient.LoginAsync(factory, claimant.Email, claimant.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(
+            admin.Client, ConversationScenarios.UniqueName("Hana Farouk"), "Mine or theirs?");
+
+        var assign = admin.Client.PostAsync(
+            $"/api/conversations/{conversation.Id}/transfer",
+            new TransferConversationRequest(colleague.Id));
+        var take = claimantSession.Client.PostAsync($"/api/conversations/{conversation.Id}/take");
+
+        await Task.WhenAll(assign, take);
+
+        var outcomes = new[] { (await assign).StatusCode, (await take).StatusCode };
+
+        outcomes.Should().Contain(HttpStatusCode.OK, "an unassigned thread has to end up with somebody");
+        outcomes.Should().NotContain(HttpStatusCode.InternalServerError);
+
+        var final = await ConversationScenarios.OpenAsync(admin.Client, conversation.Id);
+
+        final.AssignedAgentId.Should().NotBeNull();
+
+        // The invariant that matters, and the reason this is asserted rather than a fixed pair of status
+        // codes: however the two requests interleaved, the thread has exactly one owner and the history's
+        // last word about who owns it is that owner. A lost race has to say so (the loser gets a 409 and no
+        // event), and an allocation must never be recorded as a handover off an owner it never had.
+        var ownership = final.Events
+            .Where(x => x.Type is "Assigned" or "Taken" or "Transferred")
+            .ToList();
+
+        ownership.Should().NotBeEmpty();
+
+        // A Take names its owner as the actor and has no target - the agent claimed it, nobody handed it
+        // over - so the holder is whichever field that particular kind of event uses.
+        var holders = ownership.Select(x => x.Type == "Taken" ? x.ActorAgentId : x.TargetAgentId).ToList();
+
+        holders[^1].Should().Be(
+            final.AssignedAgentId,
+            "the last thing this history says about ownership is who actually holds the thread");
+
+        ownership.Count(x => x.Type == "Assigned").Should().BeLessThanOrEqualTo(1,
+            "there was one allocation to make, and a second one would mean two answers to one request");
+    }
+
+    [Fact]
+    public async Task An_allocation_that_loses_to_a_take_is_refused_rather_than_rewritten_as_a_transfer()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var colleague = await AgentScenarios.CreateAsync(admin.Client);
+        var claimant = await AgentScenarios.CreateAsync(admin.Client);
+        var claimantSession = await ApiClient.LoginAsync(factory, claimant.Email, claimant.TemporaryPassword);
+        var (_, conversation) = await ConversationScenarios.DeliverAsync(
+            admin.Client, ConversationScenarios.UniqueName("Lost Allocation"), "First come first served");
+
+        // The interleaving the HTTP race cannot be made to produce: the admin's request reads the thread
+        // as unassigned, and the take lands before its write. Driven against the same predicate the
+        // allocation uses, because that condition - not the optimistic token - is what decides it.
+        await ConversationScenarios.ActionAsync(claimantSession.Client, conversation.Id, "take");
+
+        var assignment = await WithConversationContextAsync(async db =>
+            await db.Conversations
+                .Where(x => x.Id == conversation.Id && x.AssignedAgentId == null)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.AssignedAgentId, colleague.Id)));
+
+        assignment.Should().Be(0, "a thread somebody has already taken is not available to allocate");
+
+        // And what the admin is told when that happens, which is the other half of losing the race.
+        var refused = await admin.Client.PostAsync(
+            $"/api/conversations/{conversation.Id}/transfer",
+            new TransferConversationRequest(colleague.Id));
+
+        refused.StatusCode.Should().Be(HttpStatusCode.OK,
+            "the admin may still move a taken thread - that is a transfer, and it is recorded as one");
+        (await admin.Client.ReadAsync<ConversationDetailResponse>(refused))
+            .Events.Should().ContainSingle(x => x.Type == "Transferred");
+    }
+
+    /// <summary>Runs a store-level statement on its own context, the way a second request would.</summary>
+    private async Task<T> WithConversationContextAsync<T>(Func<AppDbContext, Task<T>> work)
+    {
+        await using var scope = factory.Services.CreateAsyncScope();
+
+        return await work(scope.ServiceProvider.GetRequiredService<AppDbContext>());
     }
 
     [Fact]
