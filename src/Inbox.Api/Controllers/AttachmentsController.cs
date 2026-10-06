@@ -3,6 +3,7 @@ using Inbox.Application.Media;
 using Inbox.Domain.Identity;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Net.Http.Headers;
 
 namespace Inbox.Api.Controllers;
 
@@ -16,9 +17,11 @@ namespace Inbox.Api.Controllers;
 /// from the outside and cannot be turned into a directory listing.
 /// </para>
 /// <para>
-/// It is <c>attachment</c> disposition, never inline. The bytes are sniffed again on read and served
-/// as the type they actually are, so a file that arrived as an image cannot be handed to a browser
-/// as a page of markup even if the name says otherwise.
+/// Images render inline, but never with a type the bytes do not actually have and always with
+/// <c>nosniff</c>, so a browser is never talked into executing a stored file as a page. Everything
+/// else is an <c>attachment</c> download. The bytes are sniffed again on read and served as the type
+/// they actually are, so a file that arrived as an image cannot be handed to a browser as a page of
+/// markup even if the row says otherwise.
 /// </para>
 /// </remarks>
 [ApiController]
@@ -56,8 +59,20 @@ public sealed class AttachmentsController(IAttachmentsService attachments) : Con
 
         var file = result.Value;
 
-        // File() sets Content-Disposition: attachment with the name quoted, which is also what keeps a
-        // filename containing a quote or a newline from breaking the header.
-        return File(file.Content, file.ContentType, file.FileName);
+        // Images are safe to render inline and nothing else stored is: documents and audio are offered
+        // as downloads. The disposition is written by hand because File() always attaches and adds a
+        // filename - for an inline picture the browser should keep the original name to save with, but
+        // the disposition must say inline.
+        var disposition = new ContentDispositionHeaderValue(file.Inline ? "inline" : "attachment");
+
+        disposition.SetHttpFileName(file.FileName);
+
+        Response.Headers[HeaderNames.ContentDisposition] = disposition.ToString();
+
+        // Never let a browser sniff a type out of the bytes: the browser only gets to see the file
+        // under the type the bytes were verified to be, and nosniff locks that in.
+        Response.Headers[HeaderNames.XContentTypeOptions] = "nosniff";
+
+        return File(file.Content, file.ContentType);
     }
 }

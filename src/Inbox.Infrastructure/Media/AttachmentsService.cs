@@ -74,6 +74,21 @@ public sealed class AttachmentsService(
         // The type to serve comes from the bytes as they are on disk, re-sniffed on read, not from the
         // value recorded when they arrived. A row edited or a file swapped cannot change what the
         // browser is told to run.
-        return Result.Success(new AttachmentDownload(file.Content, attachment.FileName, file.ContentType));
+        var contentType = file.ContentType;
+
+        // Markup is refused on the way out too, whatever the row claims: the read re-sniffs, so a page
+        // that got stored past the arrival check - a directive change, a bug, a file swapped on disk -
+        // is still never handed to a browser as something it would execute.
+        if (contentType is "text/html" or "image/svg+xml")
+        {
+            return Result.Failure<AttachmentDownload>(
+                Error.Gone(
+                    AttachmentErrors.NotStored,
+                    $"The stored file was markup ('{contentType}'), which is never served."));
+        }
+
+        var inline = contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase);
+
+        return Result.Success(new AttachmentDownload(file.Content, attachment.FileName, contentType, inline));
     }
 }

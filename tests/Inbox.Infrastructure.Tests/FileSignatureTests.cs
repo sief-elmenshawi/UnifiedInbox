@@ -107,10 +107,32 @@ public sealed class FileSignatureTests
     public void A_binary_blob_is_not_reported_as_text()
     {
         // Printable ASCII with an embedded NUL: the shape of a text file used to smuggle markup past a
-        // text-only check. Must not come back as text/plain.
+        // text-only check. It is markup, so it must come back as the danger it is, never as text/plain.
         byte[] polyglot = [0x3C, 0x68, 0x74, 0x6D, 0x6C, 0x00, 0x3E, 0x00, 0x01];
 
-        FileSignature.Detect(polyglot.AsSpan()).Should().BeNull();
+        FileSignature.Detect(polyglot.AsSpan()).Should().Be("text/html");
+    }
+
+    [Fact]
+    public void Html_is_detected_as_html_not_plain_text()
+    {
+        FileSignature.Detect(
+            "<!DOCTYPE html>\n<html><body>not an image</body></html>"u8.ToArray().AsSpan())
+            .Should().Be("text/html");
+    }
+
+    [Fact]
+    public void Svg_is_detected_as_svg_not_plain_text()
+    {
+        FileSignature.Detect("<svg xmlns=\"http://www.w3.org/2000/svg\"><script>x</script></svg>"u8.ToArray().AsSpan())
+            .Should().Be("image/svg+xml");
+    }
+
+    [Fact]
+    public void Svg_wins_over_html_markers_because_it_executes_on_image_rendering()
+    {
+        FileSignature.Detect("<html><body><svg><script>x</script></svg></body></html>"u8.ToArray().AsSpan())
+            .Should().Be("image/svg+xml");
     }
 
     [Fact]

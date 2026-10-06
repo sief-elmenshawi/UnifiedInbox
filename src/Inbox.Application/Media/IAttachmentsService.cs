@@ -28,7 +28,12 @@ public interface IAttachmentsService
 /// </summary>
 /// <param name="FileName">The name to offer the browser. Sanitised when it was recorded, never a stored path.</param>
 /// <param name="ContentType">The detected type, not a claim the sender made.</param>
-public sealed record AttachmentDownload(byte[] Content, string FileName, string ContentType);
+/// <param name="Inline">
+/// Whether the bytes are safe to render inline. Only image types pass through the whitelist with a
+/// content type that exists to be inline; every other stored kind - documents, audio - is offered as
+/// a download instead.
+/// </param>
+public sealed record AttachmentDownload(byte[] Content, string FileName, string ContentType, bool Inline);
 
 /// <summary>Codes for an attachment request that did not produce a file.</summary>
 public static class AttachmentErrors

@@ -191,6 +191,22 @@ public static class FileSignature
             return "application/x-ole-storage";
         }
 
+        // HTML and SVG are markup, not documents: a browser parses and executes the <script> they can
+        // carry, so a file that renders inline as one of them is how a stored attachment becomes
+        // malware. They are checked before plain text because both are plain text minus the markers -
+        // byte for byte nothing about an HTML page breaks the text heuristic - and the whitelist then
+        // refuses the type, instead of letting the bytes through as text/plain. An SVG wins when a file
+        // is both, because it is the one that can execute on image rendering.
+        if (ContainsIgnoreCase(header, "<svg"u8)
+            || ContainsIgnoreCase(header, "<!doctype html"u8)
+            || ContainsIgnoreCase(header, "<html"u8)
+            || ContainsIgnoreCase(header, "<head"u8)
+            || ContainsIgnoreCase(header, "<body"u8)
+            || ContainsIgnoreCase(header, "<script"u8))
+        {
+            return ContainsIgnoreCase(header, "<svg"u8) ? "image/svg+xml" : "text/html";
+        }
+
         // Plain text: no NUL bytes and mostly printable ASCII. Checked last because it is the only
         // test that is a property of the content rather than a marker at a fixed offset.
         if (LooksLikeText(header))
@@ -237,6 +253,48 @@ private static bool IsPrintableAscii(byte value) =>
 
     private static bool Contains(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle) =>
         haystack.IndexOf(needle) >= 0;
+
+    /// <summary>
+    /// Whether the marker appears anywhere in the header, ignoring ASCII case. Markup is not reliable
+    /// about its own casing (<c>&lt;HTML&gt;</c> is just as executable as <c>&lt;html&gt;</c>), so the
+    /// comparison cannot be case-sensitive.
+    /// </summary>
+    private static bool ContainsIgnoreCase(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle)
+    {
+        if (haystack.Length < needle.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index <= haystack.Length - needle.Length; index++)
+        {
+            var matched = true;
+
+            for (var offset = 0; offset < needle.Length; offset++)
+            {
+                var current = haystack[index + offset];
+
+                // ASCII-only folding: the markers are ASCII and anything above that cannot be a match.
+                if (current is >= (byte)'A' and <= (byte)'Z')
+                {
+                    current = (byte)(current - 'A' + 'a');
+                }
+
+                if (current != needle[offset])
+                {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if (matched)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>
     /// Strips any <c>; charset=...</c> or <c>; codecs=...</c> parameters and lowercases.

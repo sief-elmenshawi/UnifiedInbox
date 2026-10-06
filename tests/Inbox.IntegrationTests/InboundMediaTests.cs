@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using FluentAssertions;
 using Inbox.Application.Conversations;
+using Inbox.Application.Media;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
 using Inbox.Infrastructure.Persistence;
@@ -66,11 +67,16 @@ public sealed class InboundMediaTests
         download.StatusCode.Should().Be(HttpStatusCode.OK);
         download.Content.Headers.ContentType!.MediaType.Should().Be("image/png");
 
-        // Served as an attachment, never inline: a browser must not be given a chance to interpret a
-        // file as a page.
-        download.Content.Headers.ContentDisposition!.DispositionType.Should().Be("attachment");
+        // Images may render inline, but only under the verified content type and never as markup, and
+        // the browser is told never to sniff a different type out of the bytes.
+        download.Content.Headers.ContentDisposition!.DispositionType.Should().Be("inline");
 
         (await download.Content.ReadAsByteArrayAsync()).Should().Equal(StubGraphHandler.DefaultImage);
+
+        // X-Content-Type-Options: nosniff is what stops a browser turning a stored image - or a file
+        // that claims to be one - into something it interprets. It is an HTTP header, so it travels
+        // on the response and not on the content.
+        download.Headers.GetValues("X-Content-Type-Options").Should().ContainSingle().Which.Should().Be("nosniff");
 
         // Both legs of the download carry the channel's token, because the URL Meta hands back is only
         // usable with one.
@@ -236,14 +242,14 @@ public sealed class InboundMediaTests
     }
 
     [Fact]
-    public async Task A_file_that_claims_a_type_is_stored_as_the_type_its_bytes_are()
+    public async Task An_html_file_is_refused_even_though_it_looks_like_text()
     {
         var admin = await ApiClient.LoginAsAdminAsync(factory);
         var channel = await WhatsAppScenarios.ConnectAsync(admin.Client);
 
-        // Declared as a JPEG, actually a web page. The declared type is a hint from an untrusted
-        // source, so the file is kept as text/plain - which is exactly what makes it harmless - and
-        // never served as an image.
+        // Declared as a JPEG, actually a web page. A browser would render the <script> a page carries,
+        // so markup is refused outright rather than stored: the declared type is a hint from an
+        // untrusted source, and the storage rules are about what the bytes are.
         StubGraph.Handler.WithMedia(
             "media-1234567890",
             Encoding.UTF8.GetBytes("<!DOCTYPE html><html><body>not an image</body></html>"),
@@ -257,13 +263,78 @@ public sealed class InboundMediaTests
 
         var attachment = message.Attachments.Should().ContainSingle().Subject;
 
-        attachment.Availability.Should().Be("Available");
-        attachment.ContentType.Should().Be("text/plain");
+        attachment.Availability.Should().Be("Unavailable");
+        attachment.UnavailableReason.Should().Contain("'text/html'");
 
         var download = await admin.Client.Http.GetAsync($"/api/attachments/{attachment.Id}");
 
-        download.StatusCode.Should().Be(HttpStatusCode.OK);
-        download.Content.Headers.ContentType!.MediaType.Should().Be("text/plain");
+        download.StatusCode.Should().Be(HttpStatusCode.Gone);
+    }
+
+    [Fact]
+    public async Task An_svg_file_is_refused_even_through_an_image_claim()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var channel = await WhatsAppScenarios.ConnectAsync(admin.Client);
+
+        // Declared as a PNG, actually a vector that can execute script when rendered inline. Same rule
+        // as HTML: the bytes name the type, and the whitelist refuses it.
+        StubGraph.Handler.WithMedia(
+            "media-1234567890",
+            Encoding.UTF8.GetBytes("<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>"),
+            "image/png");
+
+        var message = await DeliverMediaAsync(
+            channel,
+            "whatsapp-image-message.json",
+            ConversationScenarios.UniqueName("Vector liar"),
+            "VectorLiar");
+
+        var attachment = message.Attachments.Should().ContainSingle().Subject;
+
+        attachment.Availability.Should().Be("Unavailable");
+        attachment.UnavailableReason.Should().Contain("'image/svg+xml'");
+    }
+
+    [Fact]
+    public async Task A_stored_file_that_became_markup_on_disk_is_never_served()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var channel = await WhatsAppScenarios.ConnectAsync(admin.Client);
+
+        var message = await DeliverMediaAsync(
+            channel,
+            "whatsapp-image-message.json",
+            ConversationScenarios.UniqueName("Photo sender"),
+            "Photo");
+
+        var attachment = message.Attachments.Should().ContainSingle().Subject;
+
+        // The row is still Available - nothing in production notices a file swap on disk - but the bytes
+        // have become a page. The read re-sniffs, so the markup is refused even though the row says a
+        // picture is there, and the caller learns the file cannot be opened rather than seeing a 200.
+        await using (var scope = factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var storage = scope.ServiceProvider.GetRequiredService<IMediaStorage>();
+
+            var swapped = await storage.SaveAsync(
+                Encoding.UTF8.GetBytes("<html><body>not an image anymore</body></html>"),
+                FileSignature.ExtensionFor("text/html"));
+
+            await db.MessageAttachments
+                .Where(x => x.Id == attachment.Id)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(x => x.StoragePath, swapped));
+        }
+
+        var download = await admin.Client.Http.GetAsync($"/api/attachments/{attachment.Id}");
+
+        download.StatusCode.Should().Be(HttpStatusCode.Gone);
+        (await download.Content.ReadAsStringAsync()).Should().Contain("'text/html'");
+
+        // The body is the problem report, not the file: an available-looking row with markup behind it
+        // must not return the bytes it was asked for.
+        download.Content.Headers.ContentType!.MediaType.Should().Be("application/problem+json");
     }
 
     [Fact]
