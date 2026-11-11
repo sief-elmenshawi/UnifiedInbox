@@ -1,3 +1,4 @@
+using Inbox.Application.Options;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
 using Inbox.Domain.Enums;
@@ -112,6 +113,22 @@ public sealed record SendResult(bool Success, string? ExternalMessageId, string?
 }
 
 /// <summary>
+/// A file an agent is sending. The bytes are validated and stored before this reaches the adapter;
+/// the adapter's only job is to hand them to a provider and return what the provider said.
+/// </summary>
+/// <param name="Content">The actual bytes, already sniffed and accepted by the storage layer.</param>
+/// <param name="ContentType">The detected type, from the bytes, not something the agent's browser claimed.</param>
+/// <param name="Kind">Which family the type belongs to; decides the provider payload shape.</param>
+/// <param name="FileName">The sanitised file name, offered to the recipient where the provider allows it.</param>
+/// <param name="Caption">The agent's caption, for kinds the provider lets carry one. Null means "no text".</param>
+public sealed record OutboundMedia(
+    byte[] Content,
+    string ContentType,
+    MediaKind Kind,
+    string? FileName = null,
+    string? Caption = null);
+
+/// <summary>
 /// One per channel. Everything above it is channel-agnostic; adding Telegram later means adding
 /// this interface once and nothing else.
 /// </summary>
@@ -149,6 +166,18 @@ public interface IChannelAdapter
         Channel channel,
         string recipientExternalId,
         TemplateMessage template,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a file an agent uploaded. Implementations must not throw for provider failures:
+    /// return <see cref="SendResult.Failed"/> so the message can be stored with its failure reason.
+    /// A provider that lives on a two-step send (upload the bytes, then send the reference) does both
+    /// inside this call, so the caller never sees a half-sent media message.
+    /// </summary>
+    Task<SendResult> SendMediaAsync(
+        Channel channel,
+        string recipientExternalId,
+        OutboundMedia media,
         CancellationToken cancellationToken = default);
 
     /// <summary>

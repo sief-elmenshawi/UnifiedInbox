@@ -125,6 +125,28 @@ public sealed class TestChannelAdapter(ILogger<TestChannelAdapter> logger) : ICh
     }
 
     /// <summary>
+    /// There is no provider to upload to, so a simulated send reports the file by its type and name
+    /// the way a real one would be expected to, keeping the media code path exercised end to end.
+    /// </summary>
+    public Task<SendResult> SendMediaAsync(
+        Channel channel,
+        string recipientExternalId,
+        OutboundMedia media,
+        CancellationToken cancellationToken = default)
+    {
+        var externalMessageId = $"test-{Guid.NewGuid():N}";
+
+        logger.LogInformation(
+            "Test channel sent {ExternalMessageId} ({ContentType}, {FileName}) to {Recipient}.",
+            externalMessageId,
+            media.ContentType,
+            media.FileName,
+            recipientExternalId);
+
+        return Task.FromResult(SendResult.Sent(externalMessageId));
+    }
+
+    /// <summary>
     /// There is no provider hosting anything for a Test channel, so there is nothing to download.
     /// Reported as a failure rather than an empty success, because a caller that asked for bytes and got
     /// none must not go on to record an attachment that cannot be opened.

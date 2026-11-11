@@ -11,7 +11,9 @@ using Inbox.Application.Realtime;
 using Inbox.Infrastructure;
 using Inbox.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -26,6 +28,20 @@ builder.Services.AddApplication();
 builder.Services.AddApiAuthentication(builder.Configuration);
 builder.Services.AddApiCors(builder.Configuration);
 builder.Services.AddApiRateLimiting(builder.Configuration);
+
+// A file upload may legitimately reach Media:MaxFileSizeBytes (100 MB by default), but Kestrel and
+// the model binder both stop at roughly 30 MB out of the box - a ceiling that would reject a
+// document before the storage layer ever saw it. The wire limits are tied to the media ceiling plus
+// a little headroom for multipart boundary overhead, so "the provider's limit" and "what the API
+// accepts" stay the same number.
+var mediaMaxBytes = builder.Configuration
+    .GetSection(MediaOptions.SectionName)
+    .Get<MediaOptions>()?.MaxFileSizeBytes ?? 100L * 1024 * 1024;
+var multipartLimit = mediaMaxBytes + 4L * 1024 * 1024;
+
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = multipartLimit);
+
+builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = multipartLimit);
 
 // The dev-only controllers live in this assembly, so the part manager is what lets them be
 // stripped entirely outside Development - see DevOnlyControllerFeatureProvider.

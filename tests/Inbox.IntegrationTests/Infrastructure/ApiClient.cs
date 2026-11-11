@@ -46,6 +46,40 @@ internal sealed class ApiClient(HttpClient http)
     public Task<HttpResponseMessage> PostAsync(string url) =>
         Http.PostAsync(url, content: null);
 
+    /// <summary>
+    /// Posts one file plus an optional text field as <c>multipart/form-data</c>. The file rides under
+    /// <c>file</c> and the caption under <c>Text</c>, matching the send endpoint's binder.
+    /// </summary>
+    public async Task<HttpResponseMessage> PostMultipartAsync(
+        string url,
+        string fileName,
+        byte[] content,
+        string contentType,
+        string? text = null)
+    {
+        // The form must outlive the call: the TestHost reads the request body after SendAsync returns
+        // control to the configurable handlers, so disposing here would kill the stream mid-send.
+        var form = new MultipartFormDataContent();
+
+        try
+        {
+            var file = new ByteArrayContent(content);
+            file.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+            form.Add(file, "file", fileName);
+
+            if (text is not null)
+            {
+                form.Add(new StringContent(text), "Text");
+            }
+
+            return await Http.PostAsync(url, form);
+        }
+        finally
+        {
+            form.Dispose();
+        }
+    }
+
     public Task<HttpResponseMessage> PostAsAnonymousAsync<T>(string url, T body) =>
         Http.PostAsJsonAsync(url, body, Json);
 

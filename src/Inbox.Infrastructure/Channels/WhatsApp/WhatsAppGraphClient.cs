@@ -156,6 +156,135 @@ public sealed class WhatsAppGraphClient(
         }
     }
 
+    /// <summary>
+    /// Uploads media bytes to the provider and returns the media id the send call must reference.
+    /// </summary>
+    /// <remarks>
+    /// The Cloud API's media upload is the first half of every media send: the bytes go to
+    /// <c>POST /{phone-number-id}/media</c> as a multipart form and come back as an opaque id, which
+    /// the follow-up messages call carries instead of the bytes. The provider's own limits apply, so
+    /// a file that passed our config-driven ceilings is still refused here if Meta's are actually
+    /// tighter, and that refusal lands on the message like any other failed send.
+    /// </remarks>
+    public async Task<Result<string>> UploadMediaAsync(
+        string phoneNumberId,
+        string accessToken,
+        OutboundMedia media,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_options.GraphApiVersion))
+        {
+            return Result.Failure<string>(
+                Error.Failure("media.not_configured",
+                    "Meta:GraphApiVersion is not configured, so the media cannot be uploaded."));
+        }
+
+        using var form = new MultipartFormDataContent();
+        form.Add(new StringContent("whatsapp"), "messaging_product");
+        form.Add(new StringContent(media.ContentType), "type");
+
+        var file = new ByteArrayContent(media.Content);
+        file.Headers.ContentType = new MediaTypeHeaderValue(media.ContentType);
+        form.Add(file, "file", media.FileName ?? "attachment");
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, MediaPath(phoneNumberId))
+        {
+            Content = form
+        };
+
+        // The token authenticates this call and must never appear in a log line or an exception.
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await http.SendAsync(request, cancellationToken);
+        }
+        catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
+        {
+            logger.LogWarning(exception, "Could not reach the WhatsApp API to upload media.");
+
+            return Result.Failure<string>(
+                Error.Failure("media.provider_unreachable", "The WhatsApp API could not be reached."));
+        }
+
+        using (response)
+        {
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var reason = DescribeFailure(response.StatusCode, body);
+
+                logger.LogWarning("WhatsApp refused a media upload with {StatusCode}: {Reason}", (int)response.StatusCode, reason);
+
+                return Result.Failure<string>(Error.Failure("media.upload_rejected", reason));
+            }
+
+            var mediaId = ReadMediaId(body);
+
+            if (mediaId is null)
+            {
+                logger.LogWarning("The WhatsApp API accepted a media upload but returned no id.");
+
+                return Result.Failure<string>(
+                    Error.Failure("media.upload_rejected", "The WhatsApp API accepted the upload but returned no media id."));
+            }
+
+            return Result.Success(mediaId);
+        }
+    }
+
+    /// <summary>
+    /// Sends a message that references an uploaded media id instead of carrying the bytes.
+    /// The payload shape is per kind: an image and a document can carry the caption (and a document
+    /// can carry its file name), audio takes the id alone.
+    /// </summary>
+    public Task<SendResult> SendMediaMessageAsync(
+        string phoneNumberId,
+        string accessToken,
+        string recipient,
+        string mediaId,
+        OutboundMedia media,
+        CancellationToken cancellationToken)
+    {
+        var type = media.Kind switch
+        {
+            MediaKind.Audio => "audio",
+            MediaKind.Document => "document",
+            _ => "image"
+        };
+
+        // WhatsApp rejects an absent field and a null one differently, so the caption and the file
+        // name are only present when the agent actually supplied them.
+        object mediaBody = media.Kind switch
+        {
+            MediaKind.Audio => new { id = mediaId },
+            MediaKind.Document when media.Caption is not null =>
+                new { id = mediaId, caption = media.Caption, filename = media.FileName },
+            MediaKind.Document => new { id = mediaId, filename = media.FileName },
+            _ when media.Caption is not null => new { id = mediaId, caption = media.Caption },
+            _ => new { id = mediaId }
+        };
+
+        // The media object rides under the same key as the type: an image sends {"image": {...}},
+        // a document {"document": {...}}. A dictionary is the honest shape for a payload whose one
+        // dynamic key we have already computed.
+        var payload = new Dictionary<string, object?>
+        {
+            ["messaging_product"] = "whatsapp",
+            ["to"] = recipient,
+            ["type"] = type,
+            [type] = mediaBody
+        };
+
+        return PostAsync(phoneNumberId, accessToken, payload, cancellationToken);
+    }
+
+    private string MediaPath(string phoneNumberId) =>
+        $"{_options.GraphBaseUrl.TrimEnd('/')}/{_options.VersionSegment}/{phoneNumberId}/media";
+
     private string MessagesPath(string phoneNumberId) =>
         $"{_options.GraphBaseUrl.TrimEnd('/')}/{_options.VersionSegment}/{phoneNumberId}/messages";
 
@@ -429,6 +558,23 @@ public sealed class WhatsAppGraphClient(
                    && messages.EnumerateArray().FirstOrDefault() is { ValueKind: JsonValueKind.Object } first
                    && first.TryGetProperty("id", out var id)
                    && id.ValueKind == JsonValueKind.String
+                ? id.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Reads <c>id</c> from a media upload response.</summary>
+    private static string? ReadMediaId(string body)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(body);
+
+            return document.RootElement.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String
                 ? id.GetString()
                 : null;
         }

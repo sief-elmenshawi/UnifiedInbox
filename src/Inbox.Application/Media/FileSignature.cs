@@ -1,3 +1,5 @@
+using Inbox.Application.Options;
+
 namespace Inbox.Application.Media;
 
 /// <summary>
@@ -294,6 +296,43 @@ private static bool IsPrintableAscii(byte value) =>
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// The family a detected type belongs to. The whitelist that says whether a type is accepted
+    /// lives in configuration; this only says which of the three known families a type is in, so both
+    /// the storage layer's acceptance check and the send path can classify the same bytes the same way.
+    /// </summary>
+    public static MediaKind? KindOf(string contentType) => contentType switch
+    {
+        _ when contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) => MediaKind.Image,
+        _ when contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) => MediaKind.Audio,
+        _ when ZipBasedDocumentTypes.Contains(contentType, StringComparer.OrdinalIgnoreCase)
+             || OfficeDocumentTypes.Contains(contentType, StringComparer.OrdinalIgnoreCase)
+             || contentType is "application/pdf" or "text/plain" => MediaKind.Document,
+        _ => null
+    };
+
+    /// <summary>
+    /// Picks the specific Office format for a ZIP or OLE container, from the declared type. The
+    /// signature only proves the container, so the declared type is the only hint at which application
+    /// produced it; a declared type that matches no Office format means the file cannot be classified.
+    /// </summary>
+    public static string? ResolveOfficeType(ReadOnlyMemory<byte> content, string? declaredContentType)
+    {
+        // Only the Office types are candidates; a bare .zip is not a document we will store.
+        foreach (var candidate in OfficeDocumentTypes)
+        {
+            if (declaredContentType is not null
+                && BaseContentType(declaredContentType) == BaseContentType(candidate))
+            {
+                _ = content;
+                return candidate;
+            }
+        }
+
+        _ = content;
+        return null;
     }
 
     /// <summary>

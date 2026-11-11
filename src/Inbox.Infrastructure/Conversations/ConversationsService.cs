@@ -1,6 +1,8 @@
 using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
+using Inbox.Application.Media;
+using Inbox.Application.Options;
 using Inbox.Application.Realtime;
 using Inbox.Domain.Common;
 using Inbox.Domain.Entities;
@@ -23,6 +25,9 @@ public static class ConversationErrors
     public const string WindowClosed = "conversation.window_closed";
     public const string ChannelInactive = "conversation.channel_inactive";
     public const string ContactIdentityMissing = "conversation.contact_identity_missing";
+    public const string MediaMissing = "conversation.media_missing";
+    public const string MediaRejected = "conversation.media_rejected";
+    public const string MediaCaptionTooLong = "conversation.media_caption_too_long";
     public const string Changed = "conversation.changed";
     public const string AgentNotFound = "agent.not_found";
     public const string AgentInactive = "agent.inactive";
@@ -35,10 +40,14 @@ public sealed class ConversationsService(
     IInboxNotifier notifier,
     IWorkspaceContext workspaceContext,
     TimeProvider clock,
+    IMediaStorage storage,
     ILogger<ConversationsService> logger) : IConversationsService
 {
     private const int MaxPageSize = 100;
     private const int EventHistorySize = 50;
+
+    /// <summary>What WhatsApp itself allows on an image or document caption.</summary>
+    private const int MediaCaptionMaxLength = 1024;
 
     public async Task<Result<PagedResult<ConversationListItemResponse>>> ListAsync(
         Guid agentId,
@@ -612,8 +621,207 @@ public async Task<Result<ConversationDetailResponse>> TransferAsync(
                 cancellationToken);
         }
 
+return Result.Success(response);
+    }
+
+    /// <summary>
+    /// Sends a file an agent uploaded. Runs the same guard rails as a text send - open window,
+    /// reachable contact, active channel - so media is not a way around any of them, then validates
+    /// the bytes exactly as the inbound path does before anything is stored or reaches the provider.
+    /// </summary>
+    public async Task<Result<ConversationMessageResponse>> SendMediaAsync(
+        Guid agentId,
+        Guid conversationId,
+        OutboundMediaSend media,
+        CancellationToken cancellationToken = default)
+    {
+        if (media.Content.Length == 0)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaMissing, "The file is required and must not be empty."));
+        }
+
+        if (media.Caption is { Length: > MediaCaptionMaxLength })
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaCaptionTooLong,
+                    $"The caption may be at most {MediaCaptionMaxLength} characters."));
+        }
+
+        var conversation = await db.Conversations
+            .Include(x => x.Channel)
+            .Include(x => x.AssignedAgent)
+            .FirstOrDefaultAsync(x => x.Id == conversationId, cancellationToken);
+
+        if (conversation is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(NotFound());
+        }
+
+        if (conversation.Channel is not { IsActive: true })
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ChannelInactive, "The channel is deactivated."));
+        }
+
+        var nowUtc = clock.GetUtcNow().UtcDateTime;
+
+        if (!conversation.IsReplyWindowOpen(nowUtc))
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.WindowClosed,
+                    "The 24-hour reply window is closed; send an approved template instead."));
+        }
+
+        var recipient = await db.ContactIdentities
+            .AsNoTracking()
+            .Where(x => x.ContactId == conversation.ContactId && x.ChannelId == conversation.ChannelId)
+            .Select(x => x.ExternalId)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (recipient is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ContactIdentityMissing,
+                    "This contact is not reachable on the conversation's channel."));
+        }
+
+        var bytes = media.Content;
+
+        // Sniffed first so the attachment records the type the bytes actually are, which is the same
+        // type the storage layer is about to accept. A ZIP container is resolved to its Office format
+        // the way the inbound path resolves it, so both paths classify the same file identically.
+        var detected = FileSignature.Detect(bytes.AsSpan());
+
+        var content = detected is "application/zip" or "application/x-ole-storage"
+            ? FileSignature.ResolveOfficeType(bytes, media.DeclaredContentType) ?? detected
+            : detected ?? "application/octet-stream";
+
+        var validation = storage.Validate(bytes, media.DeclaredContentType, bytes.LongLength);
+
+        if (!validation.Accepted)
+        {
+            logger.LogInformation(
+                "Media sending to conversation {ConversationId} was not accepted: {Reason}",
+                conversationId,
+                validation.Message);
+
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaRejected, validation.Message!));
+        }
+
+        var kind = FileSignature.KindOf(content) ?? throw new InvalidOperationException(
+            $"The storage layer accepted '{content}', which maps to no media kind.");
+
+        // A caption is a caption; without one, the thread shows what was sent the way inbound media
+        // does, so an agent reading the history needs no provider screenshots to know what happened.
+        var safeName = FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(kind));
+        var text = media.Caption ?? MediaPlaceholder(kind, safeName);
+
+        var message = Message.CreateOutbound(
+            conversation.Id,
+            conversation.ChannelId,
+            agentId,
+            text,
+            MessageTypeFor(kind),
+            nowUtc);
+
+        // Replying while somebody else owns the thread is a join, recorded the same way as for a
+        // text reply so ownership history does not depend on which feature the agent used.
+        if (!conversation.IsAssignedTo(agentId))
+        {
+            await RecordJoinedEventAsync(conversationId, agentId, cancellationToken);
+        }
+
+        conversation.RecordOutbound(text, nowUtc);
+
+        if (conversation.Status == ConversationStatus.Resolved)
+        {
+            conversation.Reopen();
+            db.ConversationEvents.Add(Event(conversationId, ConversationEventType.Reopened, agentId, null));
+        }
+
+        // The bytes are stored before the row, mirroring inbound: a crash between writes leaves an
+        // orphaned file rather than a message claiming a file that is not there, and the file loses
+        // nothing by being orphaned while the message without one would be a lie.
+        var storagePath = await storage.SaveAsync(bytes, FileSignature.ExtensionFor(content), cancellationToken);
+        var attachment = MessageAttachment.Stored(
+            message.Id,
+            safeName,
+            content,
+            bytes.LongLength,
+            storagePath);
+
+        message.Attachments.Add(attachment);
+        db.Messages.Add(message);
+
+        try
+        {
+            await db.SaveChangesAsync(cancellationToken);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return Result.Failure<ConversationMessageResponse>(Changed());
+        }
+
+        var result = await adapters.Get(conversation.Channel.Type).SendMediaAsync(
+            conversation.Channel,
+            recipient,
+            new OutboundMedia(bytes, content, kind, safeName, media.Caption),
+            cancellationToken);
+
+        await ApplySendOutcomeAsync(message, result, cancellationToken);
+
+        var senderName = await db.Agents
+            .AsNoTracking()
+            .Where(x => x.Id == agentId)
+            .Select(x => x.DisplayName)
+            .FirstOrDefaultAsync(cancellationToken) ?? string.Empty;
+
+        var response = ToMessageResponse(message, senderName);
+
+        var summary = await ConversationSummaries.FirstOrDefaultAsync(db, conversationId, nowUtc, cancellationToken);
+
+        if (summary is not null)
+        {
+            var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+            await notifier.MessageReceivedAsync(workspaceId, summary, response, cancellationToken);
+            await notifier.MessageStatusUpdatedAsync(
+                workspaceId,
+                conversationId,
+                message.Id,
+                message.DeliveryStatus.ToString(),
+                cancellationToken);
+        }
+
         return Result.Success(response);
     }
+
+    private static MessageType MessageTypeFor(MediaKind kind) => kind switch
+    {
+        MediaKind.Image => MessageType.Image,
+        MediaKind.Audio => MessageType.Audio,
+        MediaKind.Document => MessageType.Document,
+        _ => MessageType.Document
+    };
+
+    /// <summary>
+    /// Text shown on the thread when the agent sent no caption, matching the wording the inbound
+    /// parser uses so an agent cannot tell a forward from a reply.
+    /// </summary>
+    private static string MediaPlaceholder(MediaKind kind, string fileName) => kind switch
+    {
+        MediaKind.Document => $"[document: {fileName}]",
+        _ => $"[{kind.ToString().ToLowerInvariant()}]"
+    };
+
+    private static string FallbackFileName(MediaKind kind) => kind switch
+    {
+        MediaKind.Image => "image",
+        MediaKind.Audio => "voice-note",
+        _ => "document"
+    };
 
     /// <summary>
     /// Sends an approved template. Outside the 24-hour window this is the only message WhatsApp

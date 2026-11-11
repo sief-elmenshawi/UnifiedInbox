@@ -22,6 +22,11 @@ internal sealed record WhatsAppChannel(
     public IReadOnlyList<GraphCall> Sends => StubGraph.Handler.Calls.Where(x => x.Uri.AbsolutePath.Contains(PhoneNumberId, StringComparison.Ordinal)).ToList();
 
     public GraphCall? LastSend => Sends.LastOrDefault();
+
+    /// <summary>Every media upload this channel's number has made, newest last.</summary>
+    public IReadOnlyList<GraphUpload> Uploads => StubGraph.Handler.Uploads;
+
+    public GraphUpload? LastUpload => StubGraph.Handler.LastUpload;
 }
 
 internal static class WhatsAppScenarios

@@ -176,7 +176,8 @@ public sealed class ConversationsController(
         return result.IsSuccess ? NoContent() : result.Error!.ToActionResult(HttpContext);
     }
 
-    [HttpPost("{conversationId:guid}/messages")]
+[HttpPost("{conversationId:guid}/messages")]
+    [Consumes("application/json")]
     [ProducesResponseType<ConversationMessageResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
@@ -197,6 +198,54 @@ public sealed class ConversationsController(
             User.GetAgentId(),
             conversationId,
             request.Text,
+            cancellationToken);
+
+        return result.IsSuccess
+            ? StatusCode(StatusCodes.Status201Created, result.Value)
+            : result.Error!.ToActionResult(HttpContext);
+    }
+
+    /// <summary>
+    /// Sends a file the agent uploaded. Shares the route with <see cref="SendMessageAsync"/>; the
+    /// <c>Content-Type</c> - JSON there, multipart/form-data here - is what picks the action.
+    /// </summary>
+    [HttpPost("{conversationId:guid}/messages")]
+    [Consumes("multipart/form-data")]
+    [ProducesResponseType<ConversationMessageResponse>(StatusCodes.Status201Created)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status422UnprocessableEntity)]
+    public async Task<ActionResult<ConversationMessageResponse>> SendMediaAsync(
+        Guid conversationId,
+        [FromForm] SendMediaRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request.File is null || request.File.Length == 0)
+        {
+            var error = Error.Validation(
+                "conversation.media_missing",
+                "The file is required and must not be empty.");
+
+            return error.ToActionResult(HttpContext);
+        }
+
+        // The bytes are read once, here, so the storage and send paths both work on the same snapshot.
+        // The name and declared type travel with them: the name is sanitised and the type sniffer
+        // decides what the file really is before anything is stored or handed to the provider.
+        using var buffer = new MemoryStream();
+
+        await request.File.CopyToAsync(buffer, cancellationToken);
+
+        var media = new OutboundMediaSend(
+            request.Text,
+            request.File.FileName,
+            request.File.ContentType,
+            buffer.ToArray());
+
+        var result = await conversations.SendMediaAsync(
+            User.GetAgentId(),
+            conversationId,
+            media,
             cancellationToken);
 
         return result.IsSuccess
@@ -234,8 +283,21 @@ public sealed class ConversationsController(
                 request.Category),
             cancellationToken);
 
-        return result.IsSuccess
+return result.IsSuccess
             ? StatusCode(StatusCodes.Status201Created, result.Value)
             : result.Error!.ToActionResult(HttpContext);
     }
+}
+
+/// <summary>
+/// A multipart send: the file itself plus an optional caption. Bound from <c>multipart/form-data</c>,
+/// with the <c>type</c> you need only because the browser insists on declaring something.
+/// </summary>
+public sealed class SendMediaRequest
+{
+    public IFormFile? File { get; set; }
+
+    /// <summary>Optional caption, stored as the message text and forwarded to the provider where its
+    /// kind allows one.</summary>
+    public string? Text { get; set; }
 }

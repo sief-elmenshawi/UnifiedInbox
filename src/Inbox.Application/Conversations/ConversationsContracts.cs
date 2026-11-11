@@ -104,6 +104,20 @@ public sealed record MessageAttachmentResponse(
 public sealed record SendMessageRequest(string Text);
 
 /// <summary>
+/// A file an agent is sending, as it left the multipart request. The bytes are validated - type
+/// sniffed, size capped - before anything is stored or sent, exactly like a file a customer sends.
+/// </summary>
+/// <param name="Caption">The agent's caption, stored as the message text where the kind lets one exist.</param>
+/// <param name="FileName">The name from the upload, sanitised before it is stored or forwarded.</param>
+/// <param name="DeclaredContentType">The browser's claim, honoured for nothing beyond picking an Office format.</param>
+/// <param name="Content">The file bytes.</param>
+public sealed record OutboundMediaSend(
+    string? Caption,
+    string FileName,
+    string? DeclaredContentType,
+    byte[] Content);
+
+/// <summary>
 /// An approved template send. Allowed outside the 24-hour window, which is the only reason it
 /// exists: <c>bodyParameters</c> are positional and map to the <c>{{1}}</c> placeholders in the
 /// template body.
@@ -171,11 +185,22 @@ public interface IConversationsService
         Guid conversationId,
         CancellationToken cancellationToken = default);
 
-    /// <summary>Sends through the channel adapter and stores the result, including failures.</summary>
+/// <summary>Sends through the channel adapter and stores the result, including failures.</summary>
     Task<Result<ConversationMessageResponse>> SendMessageAsync(
         Guid agentId,
         Guid conversationId,
         string text,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a file through the channel adapter and stores the result, including failures. Runs the
+    /// same guard rails as a text send - open window, reachable contact, active channel - so media is
+    /// not a way around any of them.
+    /// </summary>
+    Task<Result<ConversationMessageResponse>> SendMediaAsync(
+        Guid agentId,
+        Guid conversationId,
+        OutboundMediaSend media,
         CancellationToken cancellationToken = default);
 
     /// <summary>

@@ -69,6 +69,41 @@ public sealed class WhatsAppChannelAdapter(
                 cancellationToken);
     }
 
+    public async Task<SendResult> SendMediaAsync(
+        Channel channel,
+        string recipientExternalId,
+        OutboundMedia media,
+        CancellationToken cancellationToken = default)
+    {
+        var accessToken = RequireAccessToken(channel);
+
+        if (accessToken is null)
+        {
+            return MissingToken();
+        }
+
+        // Two calls, and the second needs the first's answer: the bytes go up as media and come back
+        // as an id the message must reference. An upload Meta refuses never becomes a message.
+        var upload = await graph.UploadMediaAsync(
+            channel.ExternalAccountId,
+            accessToken,
+            media,
+            cancellationToken);
+
+        if (upload.IsFailure)
+        {
+            return SendResult.Failed(upload.Error!.Message);
+        }
+
+        return await graph.SendMediaMessageAsync(
+            channel.ExternalAccountId,
+            accessToken,
+            recipientExternalId,
+            upload.Value,
+            media,
+            cancellationToken);
+    }
+
     public Task<Result<DownloadedMedia>> DownloadMediaAsync(
         Channel channel,
         InboundMedia media,

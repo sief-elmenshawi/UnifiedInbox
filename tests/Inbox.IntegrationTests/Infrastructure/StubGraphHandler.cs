@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Inbox.Infrastructure.Channels.WhatsApp;
+using Microsoft.AspNetCore.WebUtilities;
 
 namespace Inbox.IntegrationTests.Infrastructure;
 
@@ -42,6 +43,8 @@ internal sealed class StubGraphHandler : HttpMessageHandler
 
     private readonly ConcurrentQueue<GraphCall> _calls = new();
 
+    private readonly ConcurrentQueue<GraphUpload> _uploads = new();
+
     private readonly ConcurrentQueue<GraphFailure> _failures = new();
 
     private readonly ConcurrentDictionary<string, StubMedia> _media = new(StringComparer.Ordinal);
@@ -55,6 +58,12 @@ internal sealed class StubGraphHandler : HttpMessageHandler
     public IReadOnlyList<GraphCall> Calls => _calls.ToArray();
 
     public GraphCall? LastCall => _calls.LastOrDefault();
+
+    public IReadOnlyList<GraphUpload> Uploads => _uploads.ToArray();
+
+    public GraphUpload? LastUpload => _uploads.LastOrDefault();
+
+    public string? LastUploadId => LastUpload?.Id;
 
     public StubGraphHandler() => _media["*"] = new StubMedia(DefaultImage, "image/png");
 
@@ -118,6 +127,10 @@ internal sealed class StubGraphHandler : HttpMessageHandler
         {
         }
 
+        while (_uploads.TryDequeue(out _))
+        {
+        }
+
         while (_failures.TryDequeue(out _))
         {
         }
@@ -131,6 +144,15 @@ internal sealed class StubGraphHandler : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        // Media uploads answer on POST /{phone-number-id}/media. They are handled before the generic
+        // recording: the request carries a multipart body we must read, and the call is recorded in
+        // its own queue so a test can assert on it without polluting Calls - Sends is a filter of
+        // Calls by path, and the upload path contains the phone number id like every send does.
+        if (request.Method == HttpMethod.Post && request.RequestUri!.AbsolutePath.EndsWith("/media", StringComparison.OrdinalIgnoreCase))
+        {
+            return await HandleUploadAsync(request, cancellationToken);
+        }
+
         var body = request.Content is null
             ? string.Empty
             : await request.Content.ReadAsStringAsync(cancellationToken);
@@ -188,6 +210,122 @@ internal sealed class StubGraphHandler : HttpMessageHandler
                 contacts = new[] { new { input = "96550001111", wa_id = "96550001111" } },
                 messages = new[] { new { id = messageId } }
             });
+    }
+
+    /// <summary>
+    /// Answers <c>POST /{version}/{phone-number-id}/media</c>. The bytes arrive as a multipart form
+    /// (messaging_product, type, file) and the stub answers with the media id the send call will
+    /// reference, exactly as Meta does. The upload is recorded in <c>Uploads</c> - its own queue - so
+    /// tests can assert the bytes that went up without confusing <c>Calls</c>, which the send helpers
+    /// filter by phone number id.
+    /// </summary>
+    private async Task<HttpResponseMessage> HandleUploadAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // A refused upload is a refused upload: this is how a file the storage layer accepted is still
+        // stopped at the provider, and it must land on the stored message as a failure.
+        if (_failures.TryDequeue(out var failure))
+        {
+            return failure.Message.Length == 0
+                ? new HttpResponseMessage(failure.Status) { Content = new StringContent("<html>gateway</html>") }
+                : Json(
+                    failure.Status,
+                    new
+                    {
+                        error = new
+                        {
+                            message = failure.Message,
+                            type = "OAuthException",
+                            code = failure.Code,
+                            error_subcode = failure.Subcode,
+                            fbtrace_id = "Az8wQ1"
+                        }
+                    });
+        }
+
+        string? fileName = null;
+        string? contentType = null;
+        var bytes = Array.Empty<byte>();
+
+        var boundary = request.Content?.Headers.ContentType?.Parameters
+            .FirstOrDefault(parameter => parameter.Name == "boundary")?.Value;
+
+        if (request.Content is not null && boundary is not null)
+        {
+            var reader = new MultipartReader(boundary.Trim('"'), await request.Content.ReadAsStreamAsync(cancellationToken));
+
+            MultipartSection? section;
+
+            while ((section = await reader.ReadNextSectionAsync(cancellationToken)) is not null)
+            {
+                var name = DispositionParameter(section, "name");
+
+                if (string.Equals(name, "type", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var typeText = new StreamReader(section.Body);
+
+                    contentType = (await typeText.ReadToEndAsync(cancellationToken)).Trim();
+                }
+                else if (string.Equals(name, "file", StringComparison.OrdinalIgnoreCase))
+                {
+                    fileName = DispositionParameter(section, "filename");
+
+                    using var buffer = new MemoryStream();
+
+                    await section.Body.CopyToAsync(buffer, cancellationToken);
+
+                    bytes = buffer.ToArray();
+                    break;
+                }
+            }
+        }
+
+        var id = $"wa-media-{Guid.NewGuid():N}";
+
+        _uploads.Enqueue(new GraphUpload(id, fileName ?? "attachment", contentType ?? "application/octet-stream", bytes));
+
+        return Json(HttpStatusCode.OK, new { id });
+    }
+
+    /// <summary>
+    /// Reads one parameter out of a section's Content-Disposition header. The header is exposed as a
+    /// raw string (<c>form-data; name="file"; filename="itinerary.png"</c>) and a parameter value may
+    /// or may not be quoted, so it is matched on the bare name and the surrounding quotes are dropped.
+    /// </summary>
+    private static string? DispositionParameter(MultipartSection section, string parameter)
+    {
+        var disposition = section.ContentDisposition;
+
+        if (string.IsNullOrWhiteSpace(disposition))
+        {
+            return null;
+        }
+
+        var marker = parameter + "=";
+
+        var index = disposition.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+
+        if (index < 0)
+        {
+            return null;
+        }
+
+        var value = disposition[(index + marker.Length)..].TrimStart();
+
+        if (value.Length == 0)
+        {
+            return null;
+        }
+
+        if (value[0] == '"')
+        {
+            var end = value.IndexOf('"', 1);
+
+            return end < 0 ? value[1..] : value[1..end];
+        }
+
+        var separator = value.IndexOf(';');
+
+        return separator < 0 ? value : value[..separator].Trim();
     }
 
     /// <summary>
@@ -279,7 +417,31 @@ internal sealed record GraphCall(HttpMethod Method, Uri Uri, string Body, string
         Payload.GetProperty("template").TryGetProperty("components", out var components)
             ? components[0].GetProperty("parameters").EnumerateArray().Select(x => x.GetProperty("text").GetString()!).ToList()
             : [];
+
+    /// <summary>
+    /// The provider's media id a message references, for the kinds whose payload carries one
+    /// (image, document, audio, video, sticker). Null for a text or template send.
+    /// </summary>
+    public string? ReferencedMediaId
+    {
+        get
+        {
+            var type = Payload.GetProperty("type").GetString();
+
+            if (type is not ("image" or "document" or "audio" or "video" or "sticker")
+                || !Payload.TryGetProperty(type, out var media)
+                || !media.TryGetProperty("id", out var id))
+            {
+                return null;
+            }
+
+            return id.GetString();
+        }
+    }
 }
+
+/// <summary>A media upload the stub accepted, answered by a media id.</summary>
+internal sealed record GraphUpload(string Id, string FileName, string ContentType, byte[] Content);
 
 /// <summary>The stub the API is wired to for the whole run.</summary>
 internal static class StubGraph

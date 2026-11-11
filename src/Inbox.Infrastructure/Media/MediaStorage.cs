@@ -55,7 +55,9 @@ public sealed class MediaStorage(
         // extension is used only to pick among the Office formats inside that one family.
         if (detected is "application/zip" or "application/x-ole-storage")
         {
-            if (!TryResolveOfficeType(content, declaredContentType, out var officeType))
+            var officeType = FileSignature.ResolveOfficeType(content, declaredContentType);
+
+            if (officeType is null)
             {
                 return MediaValidation.Reject(
                     MediaRejectionReason.UnrecognisedType,
@@ -65,7 +67,7 @@ public sealed class MediaStorage(
             detected = officeType;
         }
 
-        var kind = KindOf(detected);
+        var kind = FileSignature.KindOf(detected);
 
         if (kind is null)
         {
@@ -173,16 +175,6 @@ public sealed class MediaStorage(
     /// <summary>
     /// Maps a detected type onto the configured allowances for its kind.
     /// </summary>
-    private MediaKind? KindOf(string contentType) => contentType switch
-    {
-        not null when contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) => MediaKind.Image,
-        not null when contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) => MediaKind.Audio,
-        _ when FileSignature.ZipBasedDocumentTypes.Contains(contentType, StringComparer.OrdinalIgnoreCase)
-            || FileSignature.OfficeDocumentTypes.Contains(contentType, StringComparer.OrdinalIgnoreCase)
-            || contentType is "application/pdf" or "text/plain" => MediaKind.Document,
-        _ => null
-    };
-
     private MediaKindLimits LimitsFor(MediaKind kind) => kind switch
     {
         MediaKind.Image => _options.Images,
@@ -201,25 +193,6 @@ public sealed class MediaStorage(
         var bare = FileSignature.BaseContentType(contentType);
 
         return limits.AllowedContentTypes.Any(allowed => FileSignature.BaseContentType(allowed) == bare);
-    }
-
-    private static bool TryResolveOfficeType(ReadOnlyMemory<byte> content, string? declaredContentType, out string officeType)
-    {
-        officeType = string.Empty;
-
-        // Only the Office types are candidates; a bare .zip is not a document we will store.
-        foreach (var candidate in FileSignature.OfficeDocumentTypes)
-        {
-            if (declaredContentType is not null
-                && FileSignature.BaseContentType(declaredContentType) == FileSignature.BaseContentType(candidate))
-            {
-                officeType = candidate;
-                return true;
-            }
-        }
-
-        _ = content;
-        return false;
     }
 
     /// <summary>
