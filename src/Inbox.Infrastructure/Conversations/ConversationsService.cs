@@ -29,6 +29,8 @@ public static class ConversationErrors
     public const string MediaMissing = "conversation.media_missing";
     public const string MediaRejected = "conversation.media_rejected";
     public const string MediaCaptionTooLong = "conversation.media_caption_too_long";
+    public const string MessageNotFound = "message.not_found";
+    public const string MessageNotRetryable = "message.not_retryable";
     public const string Changed = "conversation.changed";
     public const string AgentNotFound = "agent.not_found";
     public const string AgentInactive = "agent.inactive";
@@ -824,6 +826,159 @@ return Result.Success(response);
 
         return Result.Success(response);
     }
+
+    /// <summary>
+    /// Resends a failed outbound message. A retry is finishing something already sent, not new
+    /// activity: the message keeps its original sender and its place on the thread, no join or
+    /// reopen is recorded, nothing becomes unread and no list reorders - only the delivery status
+    /// moves. Every guard a fresh send runs is run again, because the state that failed the first
+    /// attempt may have changed since, and the outbound ceiling is re-checked against the same
+    /// bytes it bounded the first time.
+    /// </summary>
+    public async Task<Result<ConversationMessageResponse>> RetryMessageAsync(
+        Guid agentId,
+        Guid messageId,
+        CancellationToken cancellationToken = default)
+    {
+        var message = await db.Messages
+            .Include(x => x.Attachments)
+            .FirstOrDefaultAsync(x => x.Id == messageId, cancellationToken);
+
+        if (message is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.NotFound(ConversationErrors.MessageNotFound, "No message exists with that id."));
+        }
+
+        if (message.Direction is not MessageDirection.Outbound ||
+            message.DeliveryStatus is not DeliveryStatus.Failed)
+        {
+            return NotRetryable("Only a failed message this API sent can be retried.");
+        }
+
+        // A retry resends exactly one file. The send route stores at most one attachment per
+        // message, and a message with none is a text message - resending text is a new reply,
+        // which the ordinary send route is for, with its own guards about ownership and windows.
+        var attachment = message.Attachments.Count(x => x.IsAvailable) == 1
+            ? message.Attachments.Single(x => x.IsAvailable)
+            : null;
+
+        if (attachment is null || string.IsNullOrEmpty(attachment.StoragePath))
+        {
+            return NotRetryable("Only a message with an attachment can be retried.");
+        }
+
+        var kind = FileSignature.KindOf(attachment.ContentType);
+
+        // Images and documents are the agreed outbound scope, so anything else - an audio send from
+        // before that was settled, for instance - is not retryable rather than half-sent.
+        if (kind is not (MediaKind.Image or MediaKind.Document))
+        {
+            return NotRetryable("Only images and documents can be resent.");
+        }
+
+        var conversation = await db.Conversations
+            .Include(x => x.Channel)
+            .FirstOrDefaultAsync(x => x.Id == message.ConversationId, cancellationToken);
+
+        if (conversation is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(NotFound());
+        }
+
+        if (conversation.Channel is not { IsActive: true })
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ChannelInactive, "The channel is deactivated."));
+        }
+
+        var nowUtc = clock.GetUtcNow().UtcDateTime;
+
+        if (!conversation.IsReplyWindowOpen(nowUtc))
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.WindowClosed,
+                    "The 24-hour reply window is closed; send an approved template instead."));
+        }
+
+        var recipient = await db.ContactIdentities
+            .AsNoTracking()
+            .Where(x => x.ContactId == conversation.ContactId && x.ChannelId == conversation.ChannelId)
+            .Select(x => x.ExternalId)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (recipient is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.ContactIdentityMissing,
+                    "This contact is not reachable on the conversation's channel."));
+        }
+
+        var file = await storage.ReadAsync(attachment.StoragePath, cancellationToken);
+
+        if (file is null)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaMissing,
+                    "The attached file is no longer available to resend."));
+        }
+
+        var outboundCeiling = kind == MediaKind.Image
+            ? mediaOptions.Value.Outbound.MaxImageBytes
+            : mediaOptions.Value.Outbound.MaxDocumentBytes;
+
+        if (file.Content.LongLength > outboundCeiling)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaRejected,
+                    $"The file is larger than the {Ceiling(outboundCeiling)} this deployment sends for this kind of media."));
+        }
+
+        // The caption is whatever the agent wrote, unless what the thread holds is the placeholder
+        // the send put there for a file without one - that is not a caption and must not become one.
+        var caption = MediaPlaceholder(kind.Value, attachment.FileName) == message.Text
+            ? null
+            : message.Text;
+
+        // The previous attempt's reason describes an outcome that is about to be replaced; leaving
+        // it set would explain a status the message no longer has.
+        message.FailureReason = null;
+
+        var result = await adapters.Get(conversation.Channel.Type).SendMediaAsync(
+            conversation.Channel,
+            recipient,
+            new OutboundMedia(file.Content, attachment.ContentType, kind.Value, attachment.FileName, caption),
+            cancellationToken);
+
+        await ApplySendOutcomeAsync(message, result, cancellationToken);
+
+        // The sender of record is whoever wrote the message, not whoever clicked retry - the thread
+        // reads the same before and after, apart from the status.
+        var senderName = await db.Agents
+            .AsNoTracking()
+            .Where(x => x.Id == message.SenderAgentId)
+            .Select(x => x.DisplayName)
+            .FirstOrDefaultAsync(cancellationToken) ?? string.Empty;
+
+        var response = ToMessageResponse(message, senderName);
+
+        // Only the status is announced. A retry is not a new message: nobody's list should
+        // reorder, nothing becomes unread, and the agent who sent it stays the sender of record.
+        var workspaceId = await workspaceContext.GetWorkspaceIdAsync(cancellationToken);
+
+        await notifier.MessageStatusUpdatedAsync(
+            workspaceId,
+            message.ConversationId,
+            message.Id,
+            message.DeliveryStatus.ToString(),
+            cancellationToken);
+
+        return Result.Success(response);
+    }
+
+    private static Result<ConversationMessageResponse> NotRetryable(string reason) =>
+        Result.Failure<ConversationMessageResponse>(
+            Error.Validation(ConversationErrors.MessageNotRetryable, reason));
 
     private static MessageType MessageTypeFor(MediaKind kind) => kind switch
     {

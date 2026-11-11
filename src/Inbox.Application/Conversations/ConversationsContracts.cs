@@ -213,4 +213,15 @@ public interface IConversationsService
         Guid conversationId,
         TemplateMessage template,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Resends a message whose provider send failed. A retry is finishing an old attempt, not new
+    /// activity: the message keeps its original sender and its place on the thread, and only its
+    /// delivery status changes. Every guard a fresh send runs is run again, because the conditions
+    /// that failed the first attempt may have changed since.
+    /// </summary>
+    Task<Result<ConversationMessageResponse>> RetryMessageAsync(
+        Guid agentId,
+        Guid messageId,
+        CancellationToken cancellationToken = default);
 }
