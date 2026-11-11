@@ -403,8 +403,10 @@ All endpoints require JWT unless noted. Base path `/api`. Responses use a consis
 - `POST /conversations/{id}/transfer` `{targetAgentId}`
 - `POST /conversations/{id}/resolve` / `reopen`
 - `POST /conversations/{id}/read` (reset unread)
-- `POST /conversations/{id}/messages` `{text}` (later: multipart for media)
+- `POST /conversations/{id}/messages` `{text}` or `multipart/form-data` (`file` part, optional `text` caption; images and documents — phase 6)
 - `POST /conversations/{id}/template-messages` `{name, languageCode, bodyParameters[], category?}`
+- `POST /messages/{messageId}/retry` — finish a failed outbound send (phase 6)
+- `GET /attachments/{attachmentId}` — the stored file behind an attachment (phase 6)
 - `GET/POST /conversations/{id}/notes` (post-MVP)
 
 ### Webhooks (anonymous, signature-protected)
@@ -477,7 +479,8 @@ Viewers are tracked in a thread-safe in-memory store (`ConcurrentDictionary`) ke
 - Encrypt channel tokens/secrets with Data Protection; never log tokens or full payloads containing PII at Information level.
 - CORS limited to the Angular origin.
 - Rate limiting on login and webhooks.
-- Validate and size-limit uploads; store outside web root; whitelist content types.
+- Validate and size-limit uploads; store outside web root; whitelist content types. The type is sniffed from the bytes, never the declared MIME.
+- Per-endpoint request-body ceilings (`RequestSizeLimits`: 2 MB default, 1 MB webhook, media-tied for the file send), refused with `413` before the body is read.
 - Secrets via user-secrets (dev) / environment variables or a vault (prod).
 
 ## 10. Implementation Phases (do them in order, each ends with a working, tested state)
@@ -599,6 +602,49 @@ Decisions taken while building it:
 
 - Receive/download media from Meta, store files, attachments in messages; send images/documents. Size and type limits.
 
+**Status: done.** Decisions taken while building it:
+
+- **Inbound files download inside the outbox worker, not in the webhook.** The endpoint answers `200`
+  once the raw payload is durable; the worker then resolves the media (`GET /{MEDIA_ID}` answers
+  `url`, `mime_type`, `sha256`, `file_size`; the URL is valid for 5 minutes and is fetched with the
+  channel's bearer token), reads the bytes capped at the ceiling, and cross-checks the sha256 Meta
+  advertised against what arrived, so a truncated or altered transfer is refused rather than stored.
+  A media id stays resolvable for 30 days from the API (7 days from a webhook), which is why a
+  download that could not be completed fails the event for retry instead of being recorded as a
+  file we chose not to keep.
+- **Kept kinds are images, documents and audio.** Anything else (video, stickers, unknown) is
+  recorded as a `NotStored` attachment with placeholder text on the message — the reason is in the
+  row, so `GET /api/attachments/{id}` answers `410` with something an agent can act on rather than a
+  bare refusal. Bytes live under `Media:RootPath`, outside the web root, and that endpoint is the
+  only route to them.
+- **The type is decided by the bytes** (`FileSignature`), never the declared MIME: Meta declares
+  voice notes `audio/ogg; codecs=opus`, and browsers send `application/octet-stream` for anything
+  they do not recognise. Office formats collapse to the ZIP/OLE families and are mapped back to a
+  concrete type by extension. The stored file's extension comes from the detected type too, so a
+  `.html` name on text bytes cannot become a file a browser would execute.
+- **Outbound is images and documents only** — the agreed scope; audio stays inbound. A send is
+  `multipart/form-data` on `POST /api/conversations/{id}/messages`, and it walks the sequence Meta
+  requires: the file is uploaded first (`POST /{PHONE_NUMBER_ID}/media` with `messaging_product`,
+  `type`, `file`, answering `{"id"}`), then the message references that id — `image: {id, caption}` /
+  `document: {id, caption, filename}`. Captions are at most 1024 characters, the filename keeps its
+  extension, and `recipient_type` is optional and omitted.
+- **A send has its own ceilings** (`Media:Outbound`): 5 MB for an image (Meta's own image limit) and
+  16 MB for a document, deliberately below the storage ceilings — a send buffers the file in memory
+  to sniff it and hand it to the provider's upload endpoint, while a customer's document on its way
+  to disk is allowed to be far larger. WebP is supported by Meta but deliberately not enabled.
+- **A failed send can be finished, never silently retried.** `POST /api/messages/{messageId}/retry`
+  reruns every guard of a fresh send — open window, active channel, reachable contact, the outbound
+  ceiling against the same bytes — and keeps the original sender of record, the thread position and
+  the unread counts: only the delivery status moves, and only `MessageStatusUpdated` is announced.
+  Only a failed outbound message with exactly one attachment is retryable; resending text is a new
+  reply, which the ordinary send route is for.
+- **Request bodies are bounded per endpoint** (`RequestSizeLimits`): 2 MB by default, 1 MB for the
+  webhook — deliberately not configurable above that, because the endpoint is anonymous and buffers
+  the whole body before the signature can be checked — and the media ceiling plus the multipart
+  envelope for the file send. A request that declares more is refused with `413 request.too_large`
+  before a byte is read, and `IHttpMaxRequestBodySizeFeature` covers what a chunked request could
+  hide on a real Kestrel host.
+
 ### Phase 7 — Angular dashboard
 
 - Login, inbox (left list + right chat), filters, search, take/transfer/resolve, live updates through SignalR, viewing/typing indicators, admin pages (agents, channels), responsive layout for mobile.
@@ -632,7 +678,19 @@ real number, watch it arrive in the dashboard, reply, and confirm `Sent` → `De
   "Seed": { "WorkspaceName": "", "AdminEmail": "", "AdminDisplayName": "", "AdminPassword": "" },
   "Meta": { "GraphApiVersion": "<set from current Meta docs>", "GraphBaseUrl": "https://graph.facebook.com" },
   "Cors": { "AllowedOrigins": [ "http://localhost:4200" ] },
-  "Storage": { "RootPath": "" },
+  "Media": {
+    "RootPath": "",
+    "MaxFileSizeBytes": 104857600,
+    "DownloadInboundMedia": true,
+    "Images": { "MaxSizeBytes": 5242880, "AllowedContentTypes": [ "image/jpeg", "image/png" ] },
+    "Documents": { "MaxSizeBytes": 104857600, "AllowedContentTypes": [ "..." ] },
+    "Audio": { "MaxSizeBytes": 16777216, "AllowedContentTypes": [ "..." ] },
+    "Outbound": { "MaxImageBytes": 5242880, "MaxDocumentBytes": 16777216 }
+  },
+  "RequestSizeLimits": {
+    "DefaultMaxBytes": 2097152,
+    "WebhookMaxBytes": 1048576
+  },
   "RateLimiting": {
     "LoginPermitLimit": 30,
     "LoginWindowSeconds": 60,

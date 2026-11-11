@@ -85,8 +85,10 @@ Main endpoints (`Authorization: Bearer <access token>`):
 | `GET` | `/api/conversations/{id}` | Conversation plus its event history. |
 | `GET` | `/api/conversations/{id}/messages?pageSize=50&before={messageId}` | Newest first. |
 | `POST` | `/api/conversations/{id}/take\|release\|transfer\|resolve\|reopen\|read` | `transfer` body: `{"targetAgentId":"…"}`. Admin only when the thread is unassigned — that records an `Assigned` event, not a `Transferred` one. |
-| `POST` | `/api/conversations/{id}/messages` | Body `{"text":"…"}`; only inside the 24-hour reply window. |
+| `POST` | `/api/conversations/{id}/messages` | Text body `{"text":"…"}`, or `multipart/form-data` (`file` part, optional `text` caption); only inside the 24-hour reply window. |
+| `POST` | `/api/messages/{messageId}/retry` | Resend a failed outbound media message: every guard of a fresh send runs again and only the delivery status changes. |
 | `POST` | `/api/conversations/{id}/template-messages` | Body `{"name":"follow_up_quote","languageCode":"en_US","bodyParameters":["Amir"]}`; allowed even when the 24-hour window is closed. |
+| `GET` | `/api/attachments/{attachmentId}` | The stored file behind an attachment, served with the type its bytes were verified to have. `410` with the reason when the file was refused on arrival or is not kept. |
 | `GET` | `/api/channels` | Admin only. Secrets are never returned, only whether they are set. |
 | `POST` | `/api/channels` | Admin only. Body `{"type":"WhatsApp","displayName":"…","externalAccountId":"…","accessToken":"…"}`. |
 | `PUT` | `/api/channels/{id}` | Admin only. Omit a secret to keep the stored one. |
@@ -154,8 +156,16 @@ and manual re-queuing.
 ### What the payload becomes
 
 An inbound delivery creates or updates a conversation, stores the message, and pushes
-`MessageReceived` to the agents watching the thread. Media is recorded by type with its caption so the
-thread stays readable; the file itself is downloaded in a later phase.
+`MessageReceived` to the agents watching the thread. A message with media is recorded by type with its
+caption so the thread stays readable (`[image]`, `[document: name.pdf]`), and the file itself is
+downloaded from Meta while the background worker processes the event — not in the webhook — then
+checked against the same ceilings as an agent's upload and stored under `Media:RootPath`, outside the
+web root. Agents read it back through `GET /api/attachments/{id}`: there is no path in that URL, and
+the file is served with the type its bytes were verified to have. A file that was refused — over the
+configured ceiling, a type outside the allowed list, a transfer whose sha256 did not match what Meta
+advertised, or a download Meta would not serve — stays on the message as an attachment in the
+`Unavailable` state, and the download endpoint answers `410` with the reason rather than pretending
+the file exists.
 
 A status delivery reports on a message we sent, so it is matched by channel **and** the provider's
 message id, and only ever moves a message forward:
@@ -182,6 +192,36 @@ POST /api/conversations/{id}/template-messages
 
 `bodyParameters` are positional and map to the `{{1}}` placeholders in the approved template body. The
 history stores what was sent so an agent reading the thread later sees the words.
+
+### Sending files
+
+A reply can carry a file: `POST /api/conversations/{id}/messages` with `multipart/form-data` —
+a `file` part (its name and extension travel on the part itself) and an optional `text` field for the
+caption. The scope is images and documents and
+nothing else: a customer may send audio in, but an agent does not send audio out, and the request is
+refused before anything is stored or offered to the provider. The bytes are validated exactly like an
+inbound file — the type sniffed from the contents, never the name or the browser's claim — and the
+send is two provider calls, the sequence Meta requires: the file is uploaded, then the message
+references the upload by id (`image: {id, caption}` / `document: {id, caption, filename}`, captions at
+most 1024 characters).
+
+What a send may carry is bounded separately from what storage accepts, under `Media:Outbound`: an
+image at 5 MB and a document at 16 MB by default. Both sit below the storage ceilings on purpose,
+because a send buffers the file in memory to sniff it and hand it to the provider, while a customer's
+document on its way to disk is allowed to be far larger. A provider refusal lands on the message as
+`Failed` with the reason, exactly like a failed text reply; nothing is silently resent. The agent
+decides, and `POST /api/messages/{messageId}/retry` finishes the attempt: every guard of a fresh send
+runs again — open window, active channel, reachable contact, the outbound ceiling against the same
+bytes — and the message keeps its original sender and its place on the thread, so only the delivery
+status moves.
+
+### Request size limits
+
+How much body an endpoint will read is bounded per route, not by one number
+(`RequestSizeLimits`): 2 MB by default for JSON calls, 1 MB for a webhook delivery — an anonymous
+endpoint that buffers the body before the signature can be checked, which is why its ceiling cannot
+be configured above that — and the media ceiling plus envelope for the file send. A request that
+declares more is refused with `413 request.too_large` before anything reads a byte.
 
 ### Talking to WhatsApp without an account
 
@@ -263,6 +303,10 @@ tests/Fixtures            recorded WhatsApp webhook payloads, shared by both tes
 | `409` with `conversation.already_taken` | Another agent owns the conversation. Use `transfer` (owner or admin) instead of stealing it. |
 | `409` with `conversation.not_assigned` on `transfer` | The thread has no owner and you are not an admin. Use `take` to claim it; only an admin can allocate an unassigned thread to somebody else. |
 | `422` with `conversation.window_closed` | The last inbound message is older than 24 hours. Send an approved template instead: `POST /api/conversations/{id}/template-messages`. The window follows the customer timestamp in the payload, so a webhook that arrives late cannot reopen it. |
+| `413` with `request.too_large` | The request body exceeded its endpoint's ceiling: 2 MB for JSON calls (`RequestSizeLimits:DefaultMaxBytes`), 1 MB for a webhook, the media ceiling for a file send. The refusal happens before a byte is read. |
+| `422` with `conversation.media_rejected` | The file's real bytes are outside the configured `Media` limits — the type is sniffed from the contents, never taken from the name. Inbound: images 5 MB, documents 100 MB, audio 16 MB. Outbound is images and documents only, at 5 MB / 16 MB (`Media:Outbound`). |
+| `422` with `conversation.media_missing` | The attachment is recorded but the file is not there to send or open — the download never completed or the stored bytes are gone. The row survives so the thread stays honest; the bytes do not. |
+| `422` with `message.not_retryable` | Only a failed outbound message with exactly one attachment can be retried. Resending text is a new reply, which the ordinary send route is for. |
 | `403` on `/api/channels` | Agents cannot manage channels; only an admin can connect or disconnect one. |
 | `401` on `/api/webhooks/whatsapp` | `X-Hub-Signature-256` is missing or does not match the raw body signed with the channel's app secret. A tunnel that rewrites the body would do the same thing. |
 | WhatsApp deliveries arrive and are all dropped | The channel was disconnected, or its `externalAccountId` is not the phone number id from the Meta dashboard. Check the API log for the channel id. Unattributable payloads (no `metadata.phone_number_id`, or an unknown number) are answered `200` and logged rather than refused, because Meta would otherwise repeat them for days without the outcome ever changing. |
