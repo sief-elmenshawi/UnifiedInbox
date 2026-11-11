@@ -1,9 +1,10 @@
 using System.Text;
 using FluentAssertions;
 using Inbox.Application.Media;
+using Inbox.Application.Options;
 using Xunit;
 
-namespace Inbox.Infrastructure.Tests;
+namespace Inbox.Application.Tests;
 
 /// <summary>
 /// The whole point of these tests is that the answer comes from the bytes. Each case declares a
@@ -159,6 +160,116 @@ public sealed class FileSignatureTests
 
         act.Should().Throw<ArgumentException>();
     }
+
+    [Theory]
+    [InlineData("image/jpeg", MediaKind.Image)]
+    [InlineData("image/png", MediaKind.Image)]
+    [InlineData("image/webp", MediaKind.Image)]
+    [InlineData("image/svg+xml", MediaKind.Image)]
+    [InlineData("audio/ogg", MediaKind.Audio)]
+    [InlineData("audio/mpeg", MediaKind.Audio)]
+    [InlineData("audio/mp4", MediaKind.Audio)]
+    [InlineData("audio/aac", MediaKind.Audio)]
+    [InlineData("application/pdf", MediaKind.Document)]
+    [InlineData("text/plain", MediaKind.Document)]
+    [InlineData("application/zip", MediaKind.Document)]
+    [InlineData("application/msword", MediaKind.Document)]
+    [InlineData("application/vnd.openxmlformats-officedocument.wordprocessingml.document", MediaKind.Document)]
+    public void KindOf_names_the_family_a_whitelisted_type_belongs_to(string contentType, MediaKind expected) =>
+        FileSignature.KindOf(contentType).Should().Be(expected);
+
+    [Theory]
+    // The family is what the storage whitelist and the send path classify by, so a type outside the
+    // three known families has no family rather than a nearest guess - an unwhitelisted type is
+    // refused by configuration, not misfiled here.
+    [InlineData("video/mp4")]
+    [InlineData("application/gzip")]
+    [InlineData("application/octet-stream")]
+    [InlineData("text/html")]
+    [InlineData("")]
+    public void KindOf_leaves_a_type_outside_the_families_without_one(string contentType) =>
+        FileSignature.KindOf(contentType).Should().BeNull();
+
+    [Fact]
+    public void KindOf_is_case_insensitive_so_a_sloppy_sender_cannot_choose_the_answer() =>
+        FileSignature.KindOf("IMAGE/PNG").Should().Be(MediaKind.Image);
+
+    [Fact]
+    public void ResolveOfficeType_picks_the_format_the_declared_type_names()
+    {
+        // The signature can only prove "a zip"; which Office application it came from is what the
+        // declared type is for, and this is the one place that hint is honoured.
+        var docx = FileSignature.ResolveOfficeType(
+            Header(0x50, 0x4B, 0x03, 0x04),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+
+        docx.Should().Be("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    }
+
+    [Fact]
+    public void ResolveOfficeType_ignores_parameters_on_the_declared_type()
+    {
+        // Browsers and Meta both decorate content types with "; charset=..." and the like, and a
+        // family chosen from the raw string would reject the file customers most often send.
+        var xls = FileSignature.ResolveOfficeType(
+            Header(0x50, 0x4B, 0x03, 0x04),
+            "application/vnd.ms-excel; charset=binary");
+
+        xls.Should().Be("application/vnd.ms-excel");
+    }
+
+    [Fact]
+    public void ResolveOfficeType_maps_the_legacy_container_to_the_OLE_formats()
+    {
+        var doc = FileSignature.ResolveOfficeType(
+            Header(0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),
+            "application/msword");
+
+        doc.Should().Be("application/msword");
+    }
+
+    [Theory]
+    [InlineData("application/zip")]
+    [InlineData("text/plain")]
+    [InlineData("image/png")]
+    [InlineData(null)]
+    public void ResolveOfficeType_refuses_a_declared_type_that_is_no_Office_format(string? declared) =>
+        // A bare zip or a mismatched claim is not an Office document we will store; guessing one
+        // would store bytes under a type the bytes do not have.
+        FileSignature.ResolveOfficeType(Header(0x50, 0x4B, 0x03, 0x04), declared).Should().BeNull();
+
+    [Theory]
+    // Meta declares voice notes as "audio/ogg; codecs=opus" and browsers append charset to text;
+    // every equality comparison has to go through the base type or those files are refused.
+    [InlineData("audio/ogg; codecs=opus", "audio/ogg")]
+    [InlineData("text/plain; charset=utf-8", "text/plain")]
+    [InlineData("application/pdf", "application/pdf")]
+    [InlineData("  application/pdf  ", "application/pdf")]
+    [InlineData("IMAGE/PNG", "image/png")]
+    public void BaseContentType_strips_parameters_and_normalises_case(string declared, string expected) =>
+        FileSignature.BaseContentType(declared).Should().Be(expected);
+
+    [Theory]
+    [InlineData("image/jpeg", ".jpg")]
+    [InlineData("image/png", ".png")]
+    [InlineData("application/pdf", ".pdf")]
+    [InlineData("text/plain", ".txt")]
+    [InlineData("audio/mpeg", ".mp3")]
+    [InlineData("audio/mp4", ".m4a")]
+    [InlineData("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx")]
+    public void ExtensionFor_names_the_file_after_what_the_bytes_are(string contentType, string expected) =>
+        FileSignature.ExtensionFor(contentType).Should().Be(expected);
+
+    [Theory]
+    [InlineData("text/html")]
+    [InlineData("image/svg+xml")]
+    [InlineData("application/gzip")]
+    [InlineData("application/octet-stream")]
+    [InlineData("image/tiff")]
+    public void ExtensionFor_gives_nothing_rather_than_a_guessed_extension(string contentType) =>
+        // Markup especially must not be handed an extension of its own: the stored name is what a
+        // browser later trusts when it decides how to open the file.
+        FileSignature.ExtensionFor(contentType).Should().BeEmpty();
 
     private static byte[] Jpeg() => [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01];
 

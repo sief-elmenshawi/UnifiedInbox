@@ -2,7 +2,7 @@ using FluentAssertions;
 using Inbox.Application.Media;
 using Xunit;
 
-namespace Inbox.Infrastructure.Tests;
+namespace Inbox.Application.Tests;
 
 public sealed class FileNameSanitizerTests
 {
