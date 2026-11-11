@@ -200,12 +200,18 @@ public sealed class OutboundMediaTests
         var (channel, conversation) = await WhatsAppScenarios.DeliverAsync(factory);
 
         // Over the image ceiling: a PNG of 6 MB exceeds the 5 MB Meta allows, and our own ceiling is
-        // the number the provider holds us to.
+        // the number the provider holds us to. The signature is a real one - all eight PNG bytes -
+        // so the file is classified as an image and refused for its size, not for an unrecognised
+        // header that would have been refused at any size.
         var oversized = new byte[6 * 1024 * 1024];
         oversized[0] = 0x89;
         oversized[1] = 0x50;
         oversized[2] = 0x4E;
         oversized[3] = 0x47;
+        oversized[4] = 0x0D;
+        oversized[5] = 0x0A;
+        oversized[6] = 0x1A;
+        oversized[7] = 0x0A;
 
         var response = await admin.PostMultipartAsync(
             $"/api/conversations/{conversation.Id}/messages",
