@@ -98,33 +98,54 @@ public sealed class OutboundMediaTests
     }
 
     [Fact]
-    public async Task An_audio_file_is_sent_as_audio_without_a_caption()
+    public async Task An_audio_file_is_refused_before_anything_is_stored_or_sent()
     {
         var admin = (await ApiClient.LoginAsAdminAsync(factory)).Client;
         var (channel, conversation) = await WhatsAppScenarios.DeliverAsync(factory);
 
-        // Real MP3 header bytes so the file is classified as audio before it ever reaches the stub.
+        // Real MP3 header bytes so the file is genuinely classified as audio before the refusal.
         var voiceNote = Encoding.ASCII.GetBytes("ID3\x03\x00\x00\x00\x00\x00\x00");
-        var message = await SendAsync(
-            admin,
-            conversation.Id,
+
+        var response = await admin.PostMultipartAsync(
+            $"/api/conversations/{conversation.Id}/messages",
+            "note.mp3",
             voiceNote,
-            "audio/mpeg",
-            "note.mp3");
+            "audio/mpeg");
 
-        message.Type.Should().Be("Audio");
-        message.Text.Should().Be("[audio]");
+        // Images and documents are the agreed outbound scope; audio is inbound-only, and the refusal
+        // happens before anything is written or offered to the provider.
+        response.StatusCode.Should().Be(HttpStatusCode.UnprocessableEntity);
+        (await ApiClient.ReadProblemAsync(response)).ErrorCode.Should().Be("conversation.media_rejected");
+        (await ApiClient.ReadProblemAsync(response)).Detail.Should().Contain("Audio");
 
-        var attachment = message.Attachments.Should().ContainSingle().Subject;
-        attachment.ContentType.Should().Be("audio/mpeg");
+        channel.Uploads.Should().BeEmpty();
+        channel.LastSend.Should().BeNull();
+    }
 
-        // Audio carries the id alone: no caption, no file name.
-        channel.LastSend!.Type.Should().Be("audio");
-        channel.LastSend.ReferencedMediaId.Should().Be(channel.LastUpload!.Id);
+    [Fact]
+    public async Task A_document_over_the_outbound_ceiling_is_refused()
+    {
+        var admin = (await ApiClient.LoginAsAdminAsync(factory)).Client;
+        var (channel, conversation) = await WhatsAppScenarios.DeliverAsync(factory);
 
-        var audio = channel.LastSend.Payload.GetProperty("audio");
-        audio.TryGetProperty("caption", out _).Should().BeFalse();
-        audio.TryGetProperty("filename", out _).Should().BeFalse();
+        // 17 MB with a real PDF header: inside the 100 MB a customer's document may use on its way
+        // to storage, over the tighter ceiling a send holds in memory, so it is the outbound bound -
+        // not the storage bound - that refuses it.
+        var oversized = new byte[17 * 1024 * 1024];
+        Encoding.ASCII.GetBytes("%PDF-1.4\n").CopyTo(oversized, 0);
+
+        var response = await admin.PostMultipartAsync(
+            $"/api/conversations/{conversation.Id}/messages",
+            "contracts.pdf",
+            oversized,
+            "application/pdf");
+
+        response.StatusCode.Should().Be(HttpStatusCode.UnprocessableEntity);
+        (await ApiClient.ReadProblemAsync(response)).ErrorCode.Should().Be("conversation.media_rejected");
+        (await ApiClient.ReadProblemAsync(response)).Detail.Should().Contain("16 MB");
+
+        channel.Uploads.Should().BeEmpty();
+        channel.LastSend.Should().BeNull();
     }
 
     [Fact]

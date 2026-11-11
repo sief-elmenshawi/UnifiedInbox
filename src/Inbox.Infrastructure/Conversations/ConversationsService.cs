@@ -11,6 +11,7 @@ using Inbox.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Inbox.Infrastructure.Conversations;
 
@@ -41,6 +42,7 @@ public sealed class ConversationsService(
     IWorkspaceContext workspaceContext,
     TimeProvider clock,
     IMediaStorage storage,
+    IOptions<MediaOptions> mediaOptions,
     ILogger<ConversationsService> logger) : IConversationsService
 {
     private const int MaxPageSize = 100;
@@ -713,6 +715,31 @@ return Result.Success(response);
         var kind = FileSignature.KindOf(content) ?? throw new InvalidOperationException(
             $"The storage layer accepted '{content}', which maps to no media kind.");
 
+        // Outbound is images and documents, the scope that was agreed; audio stays inbound-only, where
+        // it arrives as a voice note a customer chose to record. Refused here, before anything is
+        // written or offered to the provider, so no half-send of a kind nobody asked to support.
+        if (kind is not (MediaKind.Image or MediaKind.Document))
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaRejected,
+                    "Audio files cannot be sent. Only images and documents can be sent to a customer."));
+        }
+
+        // The storage ceilings above are the inbound ones - a customer's document may legitimately be
+        // 100 MB on its way to disk. A send is different: the bytes are buffered in memory to be
+        // sniffed and uploaded, so the outbound ceiling is what bounds what one concurrent send holds,
+        // and it is deliberately lower.
+        var outboundCeiling = kind == MediaKind.Image
+            ? mediaOptions.Value.Outbound.MaxImageBytes
+            : mediaOptions.Value.Outbound.MaxDocumentBytes;
+
+        if (bytes.LongLength > outboundCeiling)
+        {
+            return Result.Failure<ConversationMessageResponse>(
+                Error.Validation(ConversationErrors.MediaRejected,
+                    $"The file is larger than the {Ceiling(outboundCeiling)} this deployment sends for this kind of media."));
+        }
+
         // A caption is a caption; without one, the thread shows what was sent the way inbound media
         // does, so an agent reading the history needs no provider screenshots to know what happened.
         var safeName = FileNameSanitizer.Sanitize(media.FileName, FallbackFileName(kind));
@@ -801,9 +828,8 @@ return Result.Success(response);
     private static MessageType MessageTypeFor(MediaKind kind) => kind switch
     {
         MediaKind.Image => MessageType.Image,
-        MediaKind.Audio => MessageType.Audio,
         MediaKind.Document => MessageType.Document,
-        _ => MessageType.Document
+        _ => throw new InvalidOperationException($"Outbound media of kind '{kind}' is not supported.")
     };
 
     /// <summary>
@@ -813,15 +839,20 @@ return Result.Success(response);
     private static string MediaPlaceholder(MediaKind kind, string fileName) => kind switch
     {
         MediaKind.Document => $"[document: {fileName}]",
-        _ => $"[{kind.ToString().ToLowerInvariant()}]"
+        _ => "[image]"
     };
 
     private static string FallbackFileName(MediaKind kind) => kind switch
     {
         MediaKind.Image => "image",
-        MediaKind.Audio => "voice-note",
         _ => "document"
     };
+
+    /// <summary>One ceiling, in the units a person reads, for the message an agent sees.</summary>
+    private static string Ceiling(long bytes) =>
+        bytes >= 1024 * 1024
+            ? string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{bytes / (1024 * 1024)} MB")
+            : string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{bytes / 1024} KB");
 
     /// <summary>
     /// Sends an approved template. Outside the 24-hour window this is the only message WhatsApp

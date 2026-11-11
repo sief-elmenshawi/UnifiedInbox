@@ -82,6 +82,41 @@ public sealed class MediaOptions
     /// placeholder text exactly as they are today, which is the pre-phase-6 behaviour.
     /// </summary>
     public bool DownloadInboundMedia { get; init; } = true;
+
+    /// <summary>
+    /// Ceilings for files an agent sends, separate from the storage ceilings above.
+    ///
+    /// <para>
+    /// The choice is buffered reads under a tighter ceiling rather than streaming: the bytes have to be
+    /// in memory anyway to be sniffed, hashed and handed to the provider's upload endpoint as one
+    /// multipart part, so a stream would only move the buffering. What the ceiling buys is the bound -
+    /// an outbound file may hold at most this much memory per concurrent send, instead of the 100 MB a
+    /// customer's document is allowed to occupy on its way to disk.
+    /// </para>
+    /// </summary>
+    public OutboundMediaLimits Outbound { get; init; } = new();
+}
+
+/// <summary>
+/// How large a file an agent may send, per kind. Outbound audio does not exist: images and documents
+/// are the agreed outbound scope, so these are the only two kinds with a ceiling.
+/// </summary>
+public sealed class OutboundMediaLimits
+{
+    /// <summary>
+    /// Ceiling on one outbound image. Meta's own image limit is 5 MB (media reference, image messages),
+    /// so the default matches it: a bigger file would be refused by the provider anyway.
+    /// </summary>
+    [Range(1, 512 * 1024 * 1024)]
+    public long MaxImageBytes { get; init; } = 5 * 1024 * 1024;
+
+    /// <summary>
+    /// Ceiling on one outbound document. Meta accepts up to 100 MB, but the send buffers the file in
+    /// memory, so the default is deliberately far below the provider's number - a customer waiting on
+    /// a reply does not need a 100 MB upload started on their behalf either.
+    /// </summary>
+    [Range(1, 512 * 1024 * 1024)]
+    public long MaxDocumentBytes { get; init; } = 16 * 1024 * 1024;
 }
 
 /// <summary>One kind of media: how large it may be and which exact content types are acceptable.</summary>

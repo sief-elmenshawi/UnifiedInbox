@@ -238,8 +238,9 @@ public sealed class WhatsAppGraphClient(
 
     /// <summary>
     /// Sends a message that references an uploaded media id instead of carrying the bytes.
-    /// The payload shape is per kind: an image and a document can carry the caption (and a document
-    /// can carry its file name), audio takes the id alone.
+    /// The payload shape is per kind: an image and a document can carry the caption, and a document
+    /// also carries its file name. Outbound audio does not exist - images and documents are the
+    /// agreed send scope - so any other kind is a programming error rather than a payload.
     /// </summary>
     public Task<SendResult> SendMediaMessageAsync(
         string phoneNumberId,
@@ -251,16 +252,15 @@ public sealed class WhatsAppGraphClient(
     {
         var type = media.Kind switch
         {
-            MediaKind.Audio => "audio",
+            MediaKind.Image => "image",
             MediaKind.Document => "document",
-            _ => "image"
+            _ => throw new InvalidOperationException($"Outbound media of kind '{media.Kind}' is not supported.")
         };
 
         // WhatsApp rejects an absent field and a null one differently, so the caption and the file
         // name are only present when the agent actually supplied them.
         object mediaBody = media.Kind switch
         {
-            MediaKind.Audio => new { id = mediaId },
             MediaKind.Document when media.Caption is not null =>
                 new { id = mediaId, caption = media.Caption, filename = media.FileName },
             MediaKind.Document => new { id = mediaId, filename = media.FileName },
