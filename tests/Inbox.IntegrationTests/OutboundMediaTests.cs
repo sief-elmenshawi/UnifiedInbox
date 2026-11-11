@@ -289,6 +289,37 @@ var response = await admin.PostMultipartAsync(
         channel.LastSend.Should().BeNull();
     }
 
+    [Fact]
+    public async Task A_media_reply_from_a_second_agent_records_that_they_joined()
+    {
+        var admin = await ApiClient.LoginAsAdminAsync(factory);
+        var owner = await AgentScenarios.CreateAsync(admin.Client);
+        var joiner = await AgentScenarios.CreateAsync(admin.Client);
+        var ownerSession = await ApiClient.LoginAsync(factory, owner.Email, owner.TemporaryPassword);
+        var joinerSession = await ApiClient.LoginAsync(factory, joiner.Email, joiner.TemporaryPassword);
+        var (channel, conversation) = await WhatsAppScenarios.DeliverAsync(factory);
+
+        await ConversationScenarios.ActionAsync(ownerSession.Client, conversation.Id, "take");
+
+        var response = await joinerSession.Client.PostMultipartAsync(
+            $"/api/conversations/{conversation.Id}/messages",
+            "itinerary.png",
+            StubGraphHandler.DefaultImage,
+            "image/png");
+
+        response.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var stored = await ConversationScenarios.OpenAsync(ownerSession.Client, conversation.Id);
+
+        // A file send joins the thread exactly like a text reply: joining is not taking, so the
+        // thread stays with the agent who owns it while the history says who spoke on it. That the
+        // send also reached the provider is what makes this a join that happened, not a claim.
+        stored.Events.Should().ContainSingle(x => x.Type == "Joined" && x.ActorAgentId == joiner.Id);
+        stored.AssignedAgentId.Should().Be(owner.Id);
+
+        channel.Uploads.Should().ContainSingle();
+    }
+
     private async Task<ConversationMessageResponse> SendAsync(
         ApiClient client,
         Guid conversationId,
