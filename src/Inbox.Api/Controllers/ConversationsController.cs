@@ -1,5 +1,6 @@
 using FluentValidation;
 using Inbox.Api.Extensions;
+using Inbox.Api.Middleware;
 using Inbox.Application.Channels;
 using Inbox.Application.Common;
 using Inbox.Application.Conversations;
@@ -211,6 +212,7 @@ public sealed class ConversationsController(
     /// </summary>
     [HttpPost("{conversationId:guid}/messages")]
     [Consumes("multipart/form-data")]
+    [RequestSizeProfile(RequestSizeProfile.Media)]
     [ProducesResponseType<ConversationMessageResponse>(StatusCodes.Status201Created)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status409Conflict)]

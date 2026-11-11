@@ -1,4 +1,5 @@
 using Inbox.Api.Extensions;
+using Inbox.Api.Middleware;
 using Inbox.Api.RateLimiting;
 using Inbox.Application.Channels;
 using Inbox.Application.Inbound;
@@ -39,6 +40,7 @@ namespace Inbox.Api.Controllers;
 [ApiController]
 [Route("api/webhooks/whatsapp")]
 [AllowAnonymous]
+[RequestSizeProfile(RequestSizeProfile.Webhook)]
 public sealed class WhatsAppWebhookController(
     AppDbContext db,
     IChannelAdapterFactory adapters,

@@ -3,6 +3,7 @@ using Inbox.Api.Controllers;
 using Inbox.Api.Extensions;
 using Inbox.Api.Hubs;
 using Inbox.Api.Middleware;
+using Inbox.Api.Options;
 using Inbox.Api.Realtime;
 using Inbox.Application;
 using Inbox.Application.Common;
@@ -29,17 +30,29 @@ builder.Services.AddApiAuthentication(builder.Configuration);
 builder.Services.AddApiCors(builder.Configuration);
 builder.Services.AddApiRateLimiting(builder.Configuration);
 
-// A file upload may legitimately reach Media:MaxFileSizeBytes (100 MB by default), but Kestrel and
-// the model binder both stop at roughly 30 MB out of the box - a ceiling that would reject a
-// document before the storage layer ever saw it. The wire limits are tied to the media ceiling plus
-// a little headroom for multipart boundary overhead, so "the provider's limit" and "what the API
-// accepts" stay the same number.
+// Request bodies are bounded per endpoint rather than by one number: a JSON call is a screenful of
+// text, an anonymous webhook is a small envelope, and the file send is the only route that carries
+// bytes. Kestrel starts from the default ceiling, and the two marked routes get their own from
+// RequestSizeLimitMiddleware, which applies them before anything reads the body.
+builder.Services.AddOptions<RequestSizeLimitsOptions>()
+    .Bind(builder.Configuration.GetSection(RequestSizeLimitsOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+var defaultMaxBytes = builder.Configuration
+    .GetSection(RequestSizeLimitsOptions.SectionName)
+    .Get<RequestSizeLimitsOptions>()?.DefaultMaxBytes ?? 2L * 1024 * 1024;
+
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = defaultMaxBytes);
+
+// A parsing limit, not a wire limit: the multipart reader counts the whole form against it, and
+// the file send is the only form this API has. It stays tied to the media ceiling plus headroom for
+// the multipart envelope, so what the binder accepts is never below what the storage layer would -
+// what the wire accepts is the middleware's business above.
 var mediaMaxBytes = builder.Configuration
     .GetSection(MediaOptions.SectionName)
     .Get<MediaOptions>()?.MaxFileSizeBytes ?? 100L * 1024 * 1024;
 var multipartLimit = mediaMaxBytes + 4L * 1024 * 1024;
-
-builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = multipartLimit);
 
 builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = multipartLimit);
 
@@ -119,6 +132,13 @@ app.UseSerilogRequestLogging();
 app.UseRateLimiter();
 
 app.UseApiCors();
+
+// Request-size ceilings. After CORS, so a browser caller that crosses the line still gets a
+// readable answer, and before authentication and every body reader - an oversized request is the
+// cheapest thing this API refuses. Rate limiting stays ahead of it, so a flood meets the budget
+// first, and a body over the endpoint's ceiling never reaches the binder or the webhook reader.
+app.UseMiddleware<RequestSizeLimitMiddleware>();
+
 app.UseAuthentication();
 app.UseAuthorization();
 
